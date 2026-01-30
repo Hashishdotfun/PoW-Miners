@@ -1,0 +1,1556 @@
+{
+  "address": "PoWgG9zPrzF2vFUQRTyU4L1aNMZmbsemxJgwhycjtS4",
+  "metadata": {
+    "name": "pow_protocol",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Proof of Work Protocol for Solana - A modern PoW system with auto-adjusting difficulty, progressive fees, and SPL2022 integration",
+    "repository": "https://github.com/yourname/pow-solana"
+  },
+  "instructions": [
+    {
+      "name": "add_pending_reward",
+      "docs": [
+        "Ajoute des tokens au pool de pending reward",
+        "",
+        "Appelé par le programme transfer hook quand la taxe est collectée.",
+        "50% de la taxe va ici (les autres 50% sont brûlés par le hook).",
+        "",
+        "# Arguments",
+        "- `amount`: Montant de tokens à ajouter"
+      ],
+      "discriminator": [
+        192,
+        70,
+        115,
+        211,
+        47,
+        140,
+        91,
+        185
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Le programme transfer hook ou autorité"
+          ],
+          "signer": true
+        },
+        {
+          "name": "pow_config",
+          "docs": [
+            "Configuration du protocole"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  119,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "claim_team_fees",
+      "docs": [
+        "Retire les fees accumulées pour la team",
+        "",
+        "Seule l'autorité peut retirer les fees.",
+        "",
+        "# Arguments",
+        "- `amount`: Montant à retirer (None = tout)"
+      ],
+      "discriminator": [
+        225,
+        197,
+        72,
+        27,
+        25,
+        200,
+        176,
+        18
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "L'autorité du protocole"
+          ],
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "pow_config"
+          ]
+        },
+        {
+          "name": "pow_config",
+          "docs": [
+            "Configuration du protocole (pour vérifier l'autorité)"
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  119,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "team_vault",
+          "docs": [
+            "Vault de la team"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  101,
+                  97,
+                  109,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "recipient",
+          "docs": [
+            "Destinataire des fees"
+          ],
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": {
+            "option": "u64"
+          }
+        }
+      ]
+    },
+    {
+      "name": "distribute_fees",
+      "docs": [
+        "Distribue les fees SOL accumulées",
+        "",
+        "Permissionless - n'importe qui peut appeler cette instruction.",
+        "Distribue selon le modèle:",
+        "- 5% → Team vault",
+        "- 57% → Buyback (60% * 95%)",
+        "- 38% → LP direct (40% * 95%)",
+        "",
+        "# Accounts",
+        "- `fee_collector`: PDA avec les fees accumulées",
+        "- `team_vault`: Reçoit 5%",
+        "- `buyback_vault`: Reçoit 57% (pour swap SOL→Token)",
+        "- `lp_vault`: Reçoit 38% (pour add liquidity)"
+      ],
+      "discriminator": [
+        120,
+        56,
+        27,
+        7,
+        53,
+        176,
+        113,
+        186
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "docs": [
+            "N'importe qui peut appeler cette instruction"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "pow_config",
+          "docs": [
+            "Configuration du protocole"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  119,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "fee_collector",
+          "docs": [
+            "Vault qui collecte les fees"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "team_vault",
+          "docs": [
+            "Vault de la team"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  101,
+                  97,
+                  109,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "buyback_vault",
+          "docs": [
+            "Vault pour le buyback"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  117,
+                  121,
+                  98,
+                  97,
+                  99,
+                  107,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "lp_vault",
+          "docs": [
+            "Vault pour la LP"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "execute_buyback",
+      "docs": [
+        "Traite les tokens achetés via buyback off-chain",
+        "",
+        "Le swap SOL → Token est fait off-chain via script TypeScript.",
+        "Cette instruction traite les tokens reçus:",
+        "- 50% sont brûlés",
+        "- 50% restent pour LP",
+        "",
+        "Permissionless - n'importe qui peut appeler."
+      ],
+      "discriminator": [
+        47,
+        32,
+        19,
+        100,
+        184,
+        96,
+        144,
+        49
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "docs": [
+            "N'importe qui peut appeler (permissionless)"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "pow_config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  119,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
+          "writable": true
+        },
+        {
+          "name": "token_vault",
+          "docs": [
+            "Vault qui contient les tokens achetés via swap off-chain",
+            "Authority = pow_config PDA"
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "initialize",
+      "docs": [
+        "Initialise le protocole PoW",
+        "",
+        "Doit être appelé une seule fois après le déploiement.",
+        "Configure tous les paramètres et crée les PDAs nécessaires.",
+        "",
+        "# Arguments",
+        "Aucun - tous les paramètres sont définis dans constants.rs",
+        "",
+        "# Accounts",
+        "- `authority`: Le déployeur qui devient l'admin",
+        "- `mint`: Le token SPL2022 à miner",
+        "- `pow_config`: PDA de configuration (créé)",
+        "- `pow_vault`: PDA pour les tokens de reward (créé)",
+        "- `team_vault`: PDA pour les fees team (créé)"
+      ],
+      "discriminator": [
+        175,
+        175,
+        109,
+        31,
+        13,
+        152,
+        155,
+        237
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "L'autorité qui initialise le protocole (devient l'admin)"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "mint",
+          "docs": [
+            "Le mint du token SPL2022",
+            "On vérifie qu'il a bien 9 décimales"
+          ]
+        },
+        {
+          "name": "pow_config",
+          "docs": [
+            "Configuration principale du protocole (PDA)"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  119,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pow_vault",
+          "docs": [
+            "Vault pour stocker les tokens (rewards pour mineurs)"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  119,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "team_vault",
+          "docs": [
+            "Vault pour collecter les fees team"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  101,
+                  97,
+                  109,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "token_program",
+          "docs": [
+            "Programme Token (SPL Token 2022)"
+          ]
+        },
+        {
+          "name": "system_program",
+          "docs": [
+            "Programme System"
+          ],
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "record_transfer_burn",
+      "docs": [
+        "Enregistre les tokens brûlés via la taxe transfert",
+        "",
+        "Pour le tracking et les stats.",
+        "",
+        "# Arguments",
+        "- `amount`: Montant brûlé"
+      ],
+      "discriminator": [
+        66,
+        35,
+        32,
+        62,
+        17,
+        231,
+        255,
+        181
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "docs": [
+            "Le programme transfer hook ou autorité"
+          ],
+          "signer": true
+        },
+        {
+          "name": "pow_config",
+          "docs": [
+            "Configuration du protocole"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  119,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "submit_proof",
+      "docs": [
+        "Soumet une preuve de travail valide",
+        "",
+        "Le mineur doit trouver un nonce tel que:",
+        "`hash(challenge || nonce) < target`",
+        "",
+        "Si la preuve est valide:",
+        "1. Le mineur paie la fee en SOL",
+        "2. Le mineur reçoit le reward (base + pending de la taxe transfert)",
+        "3. La difficulté est ajustée selon le temps écoulé",
+        "4. Un nouveau challenge est généré",
+        "",
+        "# Arguments",
+        "- `nonce`: Le nonce trouvé par le mineur",
+        "",
+        "# Accounts",
+        "- `miner`: Le mineur qui soumet la preuve",
+        "- `miner_token_account`: Token account du mineur (reçoit le reward)",
+        "- `miner_stats`: Stats du mineur (créé si nécessaire)",
+        "- `pow_config`: Configuration du protocole",
+        "- `mint`: Le token SPL2022",
+        "- `fee_collector`: PDA qui collecte les fees"
+      ],
+      "discriminator": [
+        54,
+        241,
+        46,
+        84,
+        4,
+        212,
+        46,
+        94
+      ],
+      "accounts": [
+        {
+          "name": "miner",
+          "docs": [
+            "Le mineur qui soumet la preuve"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "pow_config",
+          "docs": [
+            "Configuration du protocole"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  119,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "mint",
+          "docs": [
+            "Le mint du token"
+          ],
+          "writable": true,
+          "relations": [
+            "pow_config"
+          ]
+        },
+        {
+          "name": "miner_token_account",
+          "docs": [
+            "Token account du mineur (reçoit les rewards)"
+          ],
+          "writable": true
+        },
+        {
+          "name": "miner_stats",
+          "docs": [
+            "Statistiques du mineur (PDA)"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  105,
+                  110,
+                  101,
+                  114,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "miner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "fee_collector",
+          "docs": [
+            "Compte qui collecte les fees (PDA du programme)"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "token_program",
+          "docs": [
+            "Programme Token"
+          ]
+        },
+        {
+          "name": "system_program",
+          "docs": [
+            "Programme System"
+          ],
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "nonce",
+          "type": "u128"
+        }
+      ]
+    },
+    {
+      "name": "transfer_authority",
+      "docs": [
+        "Transfère l'autorité à une nouvelle adresse",
+        "",
+        "Sécurité: les deux autorités (ancienne et nouvelle) doivent signer"
+      ],
+      "discriminator": [
+        48,
+        169,
+        76,
+        72,
+        229,
+        180,
+        55,
+        161
+      ],
+      "accounts": [
+        {
+          "name": "current_authority",
+          "docs": [
+            "L'autorité actuelle"
+          ],
+          "signer": true
+        },
+        {
+          "name": "new_authority",
+          "docs": [
+            "La nouvelle autorité (doit aussi signer)"
+          ],
+          "signer": true
+        },
+        {
+          "name": "pow_config",
+          "docs": [
+            "Configuration du protocole"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  119,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "update_config",
+      "docs": [
+        "Met à jour la configuration du protocole",
+        "",
+        "Seule l'autorité peut appeler cette instruction.",
+        "Certains paramètres sont immuables pour garantir la confiance.",
+        "",
+        "# Arguments",
+        "- `params`: Paramètres à mettre à jour (optionnels)"
+      ],
+      "discriminator": [
+        29,
+        158,
+        252,
+        191,
+        10,
+        83,
+        219,
+        99
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "docs": [
+            "L'autorité actuelle du protocole"
+          ],
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "pow_config"
+          ]
+        },
+        {
+          "name": "pow_config",
+          "docs": [
+            "Configuration du protocole"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  119,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "UpdateConfigParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "withdraw_for_buyback",
+      "docs": [
+        "Retire le SOL du buyback_vault vers le keeper pour le swap off-chain",
+        "",
+        "Permissionless - le keeper fait le swap puis appelle execute_buyback"
+      ],
+      "discriminator": [
+        106,
+        56,
+        170,
+        217,
+        151,
+        43,
+        6,
+        139
+      ],
+      "accounts": [
+        {
+          "name": "keeper",
+          "docs": [
+            "Le keeper qui va faire le swap"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "buyback_vault",
+          "docs": [
+            "Buyback vault PDA"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  117,
+                  121,
+                  98,
+                  97,
+                  99,
+                  107,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "withdraw_for_lp",
+      "docs": [
+        "Retire le SOL du lp_vault vers le keeper pour ajouter de la liquidité",
+        "",
+        "Permissionless - le keeper ajoute la liquidité puis burn les LP tokens"
+      ],
+      "discriminator": [
+        36,
+        246,
+        66,
+        252,
+        141,
+        10,
+        153,
+        202
+      ],
+      "accounts": [
+        {
+          "name": "keeper",
+          "docs": [
+            "Le keeper qui va ajouter la liquidité"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "lp_vault",
+          "docs": [
+            "LP vault PDA"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  112,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    }
+  ],
+  "accounts": [
+    {
+      "name": "MinerStats",
+      "discriminator": [
+        112,
+        155,
+        146,
+        78,
+        7,
+        210,
+        252,
+        208
+      ]
+    },
+    {
+      "name": "PowConfig",
+      "discriminator": [
+        12,
+        63,
+        174,
+        43,
+        190,
+        116,
+        166,
+        15
+      ]
+    },
+    {
+      "name": "TeamVault",
+      "discriminator": [
+        145,
+        99,
+        171,
+        194,
+        242,
+        75,
+        20,
+        87
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "InvalidProof",
+      "msg": "Invalid proof: hash does not meet difficulty target"
+    },
+    {
+      "code": 6001,
+      "name": "InvalidNonce",
+      "msg": "Invalid nonce provided"
+    },
+    {
+      "code": 6002,
+      "name": "ChallengeExpired",
+      "msg": "Challenge has expired, please get a new one"
+    },
+    {
+      "code": 6003,
+      "name": "ChallengeNotFound",
+      "msg": "Challenge not found or already used"
+    },
+    {
+      "code": 6004,
+      "name": "NotInitialized",
+      "msg": "Protocol is not yet initialized"
+    },
+    {
+      "code": 6005,
+      "name": "AlreadyInitialized",
+      "msg": "Protocol is already initialized"
+    },
+    {
+      "code": 6006,
+      "name": "ProtocolPaused",
+      "msg": "Protocol is paused"
+    },
+    {
+      "code": 6007,
+      "name": "MiningNotStarted",
+      "msg": "Mining has not started yet"
+    },
+    {
+      "code": 6008,
+      "name": "MaxSupplyReached",
+      "msg": "Max supply reached, no more tokens can be mined"
+    },
+    {
+      "code": 6009,
+      "name": "Unauthorized",
+      "msg": "Unauthorized: caller is not the authority"
+    },
+    {
+      "code": 6010,
+      "name": "InvalidAuthority",
+      "msg": "Invalid authority provided"
+    },
+    {
+      "code": 6011,
+      "name": "InvalidMint",
+      "msg": "Invalid mint address"
+    },
+    {
+      "code": 6012,
+      "name": "Overflow",
+      "msg": "Arithmetic overflow"
+    },
+    {
+      "code": 6013,
+      "name": "Underflow",
+      "msg": "Arithmetic underflow"
+    },
+    {
+      "code": 6014,
+      "name": "DivisionByZero",
+      "msg": "Division by zero"
+    },
+    {
+      "code": 6015,
+      "name": "InvalidCalculation",
+      "msg": "Invalid calculation result"
+    },
+    {
+      "code": 6016,
+      "name": "InsufficientFeePayment",
+      "msg": "Insufficient SOL for mining fee"
+    },
+    {
+      "code": 6017,
+      "name": "FeeCalculationError",
+      "msg": "Fee calculation error"
+    },
+    {
+      "code": 6018,
+      "name": "EmptyFeeVault",
+      "msg": "Fee vault is empty"
+    },
+    {
+      "code": 6019,
+      "name": "BlockTooFast",
+      "msg": "Block submitted too quickly, please wait"
+    },
+    {
+      "code": 6020,
+      "name": "InvalidTimestamp",
+      "msg": "Invalid timestamp"
+    },
+    {
+      "code": 6021,
+      "name": "InvalidDifficulty",
+      "msg": "Invalid difficulty value"
+    },
+    {
+      "code": 6022,
+      "name": "InvalidReward",
+      "msg": "Invalid reward value"
+    },
+    {
+      "code": 6023,
+      "name": "InvalidFeePercentage",
+      "msg": "Invalid fee percentage"
+    },
+    {
+      "code": 6024,
+      "name": "AmmOperationFailed",
+      "msg": "AMM operation failed"
+    },
+    {
+      "code": 6025,
+      "name": "InsufficientLiquidity",
+      "msg": "Insufficient liquidity"
+    },
+    {
+      "code": 6026,
+      "name": "SlippageExceeded",
+      "msg": "Slippage tolerance exceeded"
+    },
+    {
+      "code": 6027,
+      "name": "InvalidPool",
+      "msg": "Invalid pool address"
+    },
+    {
+      "code": 6028,
+      "name": "InvalidAccountData",
+      "msg": "Invalid account data"
+    },
+    {
+      "code": 6029,
+      "name": "AccountNotWritable",
+      "msg": "Account not writable"
+    },
+    {
+      "code": 6030,
+      "name": "InvalidPDA",
+      "msg": "Invalid PDA derivation"
+    },
+    {
+      "code": 6031,
+      "name": "AccountAlreadyExists",
+      "msg": "Account already exists"
+    }
+  ],
+  "types": [
+    {
+      "name": "MinerStats",
+      "docs": [
+        "Statistiques d'un mineur individuel"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "miner",
+            "docs": [
+              "Adresse du mineur"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "blocks_mined",
+            "docs": [
+              "Nombre de blocs minés par ce mineur"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_tokens_earned",
+            "docs": [
+              "Total de tokens gagnés"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_fees_paid",
+            "docs": [
+              "Total de fees SOL payées"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "first_block_ts",
+            "docs": [
+              "Timestamp du premier bloc miné"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "last_block_ts",
+            "docs": [
+              "Timestamp du dernier bloc miné"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "docs": [
+              "Bump du PDA"
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PowConfig",
+      "docs": [
+        "Configuration principale du protocole PoW",
+        "Stocke tous les paramètres et l'état global"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "docs": [
+              "Autorité du protocole (peut mettre à jour les paramètres)"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "docs": [
+              "Adresse du mint SPL2022"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "difficulty",
+            "docs": [
+              "Difficulté actuelle (plus c'est grand, plus c'est difficile)"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "last_block_ts",
+            "docs": [
+              "Timestamp du dernier bloc miné"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "blocks_mined",
+            "docs": [
+              "Nombre total de blocs minés"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_supply_mined",
+            "docs": [
+              "Supply totale minée (en base décimales)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "current_challenge",
+            "docs": [
+              "Challenge actuel (seed pour le PoW)"
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "pending_reward_tokens",
+            "docs": [
+              "Pending reward tokens (venant de la taxe transfert SPL2022)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "fee_sol_current",
+            "docs": [
+              "Fee SOL actuelle (en lamports)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_fees_collected",
+            "docs": [
+              "Total des fees SOL collectées depuis le début"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_team_fees",
+            "docs": [
+              "Total SOL envoyé à la team"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_buyback_sol",
+            "docs": [
+              "Total SOL utilisé pour buyback"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_lp_sol",
+            "docs": [
+              "Total SOL ajouté à la LP"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_burned_from_buyback",
+            "docs": [
+              "Total de tokens brûlés (via buyback)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_burned_from_transfer_tax",
+            "docs": [
+              "Total de tokens brûlés (via taxe transfert)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "launch_ts",
+            "docs": [
+              "Timestamp du lancement du protocole"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "last_fee_update_ts",
+            "docs": [
+              "Timestamp de la dernière mise à jour de fee"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "is_initialized",
+            "docs": [
+              "Est-ce que le protocole est initialisé"
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "is_paused",
+            "docs": [
+              "Est-ce que le protocole est en pause"
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "bump",
+            "docs": [
+              "Bump du PDA"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "block_timestamps",
+            "docs": [
+              "Circular buffer of last N block timestamps for moving average",
+              "Used to smooth difficulty adjustments and reduce volatility"
+            ],
+            "type": {
+              "array": [
+                "i64",
+                10
+              ]
+            }
+          },
+          {
+            "name": "block_timestamps_index",
+            "docs": [
+              "Current index in the circular buffer (0-9)"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "block_timestamps_count",
+            "docs": [
+              "Number of timestamps stored (0-10, used during initial fill)"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "_padding",
+            "docs": [
+              "Padding pour alignement et futures extensions"
+            ],
+            "type": {
+              "array": [
+                "u8",
+                30
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "TeamVault",
+      "docs": [
+        "Vault simple pour tracker les fees team"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "total_collected",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateConfigParams",
+      "docs": [
+        "Paramètres optionnels de mise à jour"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "new_authority",
+            "docs": [
+              "Nouvelle autorité (si Some)"
+            ],
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "new_min_difficulty",
+            "docs": [
+              "Nouvelle difficulté minimum"
+            ],
+            "type": {
+              "option": "u128"
+            }
+          },
+          {
+            "name": "pause",
+            "docs": [
+              "Mettre en pause / reprendre"
+            ],
+            "type": {
+              "option": "bool"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

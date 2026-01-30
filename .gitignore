@@ -1,0 +1,38 @@
+# Build artifacts
+dist/
+build/
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock
+
+# Config files (contain wallet paths & RPC URLs)
+miner-config.json
+miner-config-devnet.json
+miner-config-mainnet.json
+
+# Wallet / keypair files
+*.keypair
+wallets-privacy/
+miner-identity.json
+
+# Database (claims, settings)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

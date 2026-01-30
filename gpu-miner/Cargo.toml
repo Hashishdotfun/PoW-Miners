@@ -1,0 +1,60 @@
+[package]
+name = "pow-miner"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "High-performance GPU miner for PoW Solana protocol"
+
+[[bin]]
+name = "miner"
+path = "src/main.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/benchmark.rs"
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["cudarc"]
+opencl = ["ocl"]
+all = ["cpu", "cuda", "opencl"]
+
+[dependencies]
+# Solana - Utiliser les versions du workspace pour éviter les conflits
+anchor-client = { version = "0.31.1", features = ["async"] }
+anchor-lang = "0.31.1"
+
+# Crypto
+sha2 = "0.10"
+sha3 = "0.10"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Logging
+env_logger = "0.11"
+log = "0.4"
+
+# Utils
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+hex = "0.4"
+
+# CUDA (optionnel)
+cudarc = { version = "0.11", optional = true, features = ["cuda-12050"] }
+
+# OpenCL (optionnel)
+ocl = { version = "0.19", optional = true }
+
+# Performance
+rayon = "1.8"
+crossbeam = "0.8"
+num_cpus = "1"
+
+[dev-dependencies]
+criterion = "0.5"
