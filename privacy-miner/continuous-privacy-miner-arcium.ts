@@ -65,7 +65,7 @@ const configPath = useLocal
 const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
 // Program IDs (pow-protocol is derived from IDL address to avoid stale config)
-const POW_PRIVACY_ID = new PublicKey("EnchaSHvRoShUp6zrF2awSeQGVYjGFZfjpkdoi2nKPBk");
+const POW_PRIVACY_ID = new PublicKey("ENCH3LVUcMHpei1ByFLGwS4cGd3FEVtER1D4ZXov4qhW");
 const TRANSFER_HOOK_PROGRAM_ID = new PublicKey("4Q1SrMmhDhtkgsQiCutmkJxYJ1TWYTm9oh5R3h9tENcZ");
 const POW_PROTOCOL_ID = new PublicKey("PoWgG9zPrzF2vFUQRTyU4L1aNMZmbsemxJgwhycjtS4");
 const MINT = new PublicKey(config.mint);

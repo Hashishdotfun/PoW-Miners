@@ -233,7 +233,7 @@ Destinations are **never** visible on-chain.
 | Program | Address |
 |---------|---------|
 | **pow-protocol** | `PoWgG9zPrzF2vFUQRTyU4L1aNMZmbsemxJgwhycjtS4` |
-| **pow-privacy** | `EnchaSHvRoShUp6zrF2awSeQGVYjGFZfjpkdoi2nKPBk` |
+| **pow-privacy** | `ENCH3LVUcMHpei1ByFLGwS4cGd3FEVtER1D4ZXov4qhW` |
 
 ## License
 
