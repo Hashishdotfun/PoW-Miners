@@ -8,7 +8,7 @@
 
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { PublicKey, Keypair, SystemProgram } from "@solana/web3.js";
+import { PublicKey, Keypair, SystemProgram, ComputeBudgetProgram } from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddressSync,
@@ -222,6 +222,11 @@ async function main() {
 
       const nonceNum = new anchor.BN(result.nonce.toString());
 
+      // Add compute budget for the transaction (program has debug logs)
+      const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+        units: 400_000,
+      });
+
       const tx = await program.methods
         .submitProof(nonceNum)
         .accounts({
@@ -234,6 +239,7 @@ async function main() {
           tokenProgram: TOKEN_2022_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
         })
+        .preInstructions([computeBudgetIx])
         .rpc();
 
       await connection.confirmTransaction(tx, "confirmed");
@@ -251,8 +257,20 @@ async function main() {
     } catch (err: any) {
       console.error("❌ Error:", err.message);
       if (err.logs) {
-        console.error("   Logs:", err.logs.slice(0, 5));
+        console.error("   Full Logs:");
+        err.logs.forEach((log: string, i: number) => console.error(`     [${i}] ${log}`));
       }
+      if (err.error) {
+        console.error("   Error details:", JSON.stringify(err.error, null, 2));
+      }
+      // Show accounts used
+      console.error("   Accounts:");
+      console.error("     Miner:", wallet.publicKey.toString());
+      console.error("     PowConfig:", powConfig.toString());
+      console.error("     Mint:", MINT.toString());
+      console.error("     MinerTokenAccount:", minerTokenAccount.toString());
+      console.error("     MinerStats:", minerStats.toString());
+      console.error("     FeeVault:", feeVault.toString());
       console.log("   Retrying in 5s...\n");
       await new Promise(r => setTimeout(r, 5000));
     }

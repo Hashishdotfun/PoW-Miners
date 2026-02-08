@@ -65,9 +65,9 @@ const configPath = useLocal
 const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
 // Program IDs (pow-protocol is derived from IDL address to avoid stale config)
-const POW_PRIVACY_ID = new PublicKey("ENCH3LVUcMHpei1ByFLGwS4cGd3FEVtER1D4ZXov4qhW");
+const POW_PRIVACY_ID = new PublicKey("HHTo8FEGs8J7VfCD5yDg3ifoKozSaY2cbLfC2U418XjP");
 const TRANSFER_HOOK_PROGRAM_ID = new PublicKey("4Q1SrMmhDhtkgsQiCutmkJxYJ1TWYTm9oh5R3h9tENcZ");
-const POW_PROTOCOL_ID = new PublicKey("PoWgG9zPrzF2vFUQRTyU4L1aNMZmbsemxJgwhycjtS4");
+const POW_PROTOCOL_ID = new PublicKey("6DEmqXKEokfBz2wiREVthwbkDECvrWorkJNd48duatL2");
 const MINT = new PublicKey(config.mint);
 
 // Arcium cluster offset (fallback to devnet v0.6.3 if env not set)

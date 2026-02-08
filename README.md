@@ -76,8 +76,8 @@ Edit `miner-config-devnet.json`:
 ```json
 {
   "rpc_url": "https://api.devnet.solana.com",
-  "program_id": "PoWgG9zPrzF2vFUQRTyU4L1aNMZmbsemxJgwhycjtS4",
-  "mint": "HaShish4TSSxVg5gvEHLAttzifzapwPzmcH1MFtWjwC8",
+  "program_id": "6DEmqXKEokfBz2wiREVthwbkDECvrWorkJNd48duatL2",
+  "mint": "8MFYkW8Mx4pVm9pAKj15iigDgQ2ZCXXeoRzRHp2x3CEs",
   "wallet_path": "/absolute/path/to/your/wallet.json",
   "relayer_wallet_path": "/absolute/path/to/your/relayer.json"
 }
@@ -232,8 +232,8 @@ Destinations are **never** visible on-chain.
 
 | Program | Address |
 |---------|---------|
-| **pow-protocol** | `PoWgG9zPrzF2vFUQRTyU4L1aNMZmbsemxJgwhycjtS4` |
-| **pow-privacy** | `ENCH3LVUcMHpei1ByFLGwS4cGd3FEVtER1D4ZXov4qhW` |
+| **pow-protocol** | `6DEmqXKEokfBz2wiREVthwbkDECvrWorkJNd48duatL2` |
+| **pow-privacy** | `HHTo8FEGs8J7VfCD5yDg3ifoKozSaY2cbLfC2U418XjP` |
 
 ## License
 
