@@ -1,8 +1,8 @@
 {
   "rpc_url": "https://api.devnet.solana.com",
-  "program_id": "6DEmqXKEokfBz2wiREVthwbkDECvrWorkJNd48duatL2",
-  "mint": "8MFYkW8Mx4pVm9pAKj15iigDgQ2ZCXXeoRzRHp2x3CEs",
+  "program_id": "Ai9XrxSUmDLNCXkoeoqnYuzPgN9F2PeF9WtLq9GyqER",
+  "mint": "ACnhuoJn41PQQKfhuHYgAQXR3jPSg1i4zr59Qt68QAUR",
   "wallet_path": "/path/to/your/wallet.json",
   "relayer_wallet_path": "/path/to/your/relayer.json",
-  "pool_id": "DKoHD42U67kBA2duzgtpwWqGKEiTkC8YAA9M8BB9rwkY"
+  "pool_id": "B9g6VbfTeJb2LERzWpFGYQMd1Pi93pzmA1v5XdDiUm98"
 }

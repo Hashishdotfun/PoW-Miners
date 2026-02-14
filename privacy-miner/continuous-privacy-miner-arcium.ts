@@ -65,9 +65,9 @@ const configPath = useLocal
 const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
 // Program IDs (pow-protocol is derived from IDL address to avoid stale config)
-const POW_PRIVACY_ID = new PublicKey("HHTo8FEGs8J7VfCD5yDg3ifoKozSaY2cbLfC2U418XjP");
+const POW_PRIVACY_ID = new PublicKey("9iC7Ez6VcqG9TvPEZ31szdnhUrsCYBvmj2u9YeDBWErT");
 const TRANSFER_HOOK_PROGRAM_ID = new PublicKey("4Q1SrMmhDhtkgsQiCutmkJxYJ1TWYTm9oh5R3h9tENcZ");
-const POW_PROTOCOL_ID = new PublicKey("6DEmqXKEokfBz2wiREVthwbkDECvrWorkJNd48duatL2");
+const POW_PROTOCOL_ID = new PublicKey("Ai9XrxSUmDLNCXkoeoqnYuzPgN9F2PeF9WtLq9GyqER");
 const MINT = new PublicKey(config.mint);
 
 // Arcium cluster offset (fallback to devnet v0.6.3 if env not set)
@@ -88,6 +88,12 @@ const ARCIUM_CLOCK = getClockAccAddress();
 const POW_CONFIG_SEED = Buffer.from("pow_config");
 const POW_FEE_VAULT_SEED = Buffer.from("fee_vault");
 const POW_MINER_STATS_SEED = Buffer.from("miner_stats");
+const POW_MINT_AUTHORITY_SEED = Buffer.from("pow_mint_auth");
+const DEVICE_ATTEST_SEED = Buffer.from("device_attest");
+
+// Pool IDs
+const POOL_NORMAL: number = 0;
+const POOL_SEEKER: number = 1;
 
 // Seeds for transfer hook
 const HOOK_EXTRA_ACCOUNT_METAS_SEED = Buffer.from("extra-account-metas");
@@ -99,7 +105,6 @@ const PRIVACY_AUTHORITY_SEED = Buffer.from("privacy_authority");
 const SHARED_TOKEN_VAULT_SEED = Buffer.from("shared_token_vault");
 const SHARED_FEE_VAULT_SEED = Buffer.from("shared_fee_vault");
 const CLAIM_SEED = Buffer.from("claim");
-const CLAIM_BUFFER_SEED = Buffer.from("claim_buffer");
 const CLAIM_REQUEST_BUFFER_SEED = Buffer.from("claim_request_buffer");
 const DEPOSIT_BUFFER_SEED = Buffer.from("deposit_buffer");
 const WITHDRAW_BUFFER_SEED = Buffer.from("withdraw_buffer");
@@ -244,19 +249,11 @@ async function handleDeposit(
     const idl = JSON.parse(fs.readFileSync(__dirname + "/../target/idl/pow_privacy.json", "utf-8"));
     const minerProgram = new Program(idl, minerProvider);
 
-    // Load or create miner identity
-    const identity = loadOrCreateMinerIdentity();
     const clientPrivateKey = x25519.utils.randomSecretKey();
     const clientPublicKey = x25519.getPublicKey(clientPrivateKey);
+    const nonce = randomBytes(16);
 
-    // Encrypt miner_id_hash
-    const { ciphertext: encryptedMinerIdHash, nonce } = encryptMinerIdHash(
-      identity.minerIdHash,
-      mxePublicKey,
-      clientPrivateKey
-    );
-
-    // Encrypt amount
+    // Encrypt amount (single u64 ciphertext)
     const encryptedAmount = encryptAmount(
       BigInt(amountLamports),
       mxePublicKey,
@@ -264,33 +261,32 @@ async function handleDeposit(
       nonce
     );
 
-    // Encrypt signature
-    const encryptedSignature = encryptSignature(
-      identity.secretKey,
-      "deposit",
-      BigInt(amountLamports),
+    // Encrypt current miner state (balance, nonce, reserved) - 3 x u64 ciphertexts
+    const minerState = loadMinerState();
+    const encryptedState = encryptCurrentState(
+      minerState.balance,
+      minerState.stateNonce,
+      minerState.reserved,
       mxePublicKey,
       clientPrivateKey,
       nonce
     );
 
     // Convert to expected format
-    const encryptedMinerIdHashArray: number[][] = encryptedMinerIdHash.map(c => Array.from(c));
     const encryptedAmountArray: number[] = Array.from(encryptedAmount);
-    const encryptedSignatureArray: number[][] = encryptedSignature.map(c => Array.from(c));
+    const encryptedCurrentStateArray: number[][] = encryptedState.map(c => Array.from(c));
 
-    // Derive deposit buffer PDA (using miner wallet)
+    // Derive deposit buffer PDA (using first 8 bytes of encrypted_amount)
     const [depositBufferPda] = PublicKey.findProgramAddressSync(
-      [DEPOSIT_BUFFER_SEED, minerWallet.publicKey.toBuffer(), encryptedMinerIdHash[0].slice(0, 8)],
+      [DEPOSIT_BUFFER_SEED, minerWallet.publicKey.toBuffer(), encryptedAmount.slice(0, 8)],
       POW_PRIVACY_ID
     );
 
     console.log("Creating deposit buffer...");
     const createBufferTx = await minerProgram.methods
       .createDepositBuffer(
-        encryptedMinerIdHashArray,
         encryptedAmountArray,
-        encryptedSignatureArray,
+        encryptedCurrentStateArray,
         Array.from(clientPublicKey),
         new anchor.BN(deserializeLE(nonce).toString()),
         new anchor.BN(amountLamports),
@@ -428,18 +424,11 @@ async function handleWithdraw(
     const idl = JSON.parse(fs.readFileSync(__dirname + "/../target/idl/pow_privacy.json", "utf-8"));
     const minerProgram = new Program(idl, minerProvider);
 
-    const identity = loadOrCreateMinerIdentity();
     const clientPrivateKey = x25519.utils.randomSecretKey();
     const clientPublicKey = x25519.getPublicKey(clientPrivateKey);
+    const nonce = randomBytes(16);
 
-    // Encrypt miner_id_hash
-    const { ciphertext: encryptedMinerIdHash, nonce } = encryptMinerIdHash(
-      identity.minerIdHash,
-      mxePublicKey,
-      clientPrivateKey
-    );
-
-    // Encrypt amount
+    // Encrypt amount (single u64 ciphertext)
     const encryptedAmount = encryptAmount(
       BigInt(amountLamports),
       mxePublicKey,
@@ -447,7 +436,7 @@ async function handleWithdraw(
       nonce
     );
 
-    // Encrypt destination
+    // Encrypt destination (4 x u64 ciphertexts)
     const encryptedDestination = encryptDestinationForWithdraw(
       destination,
       mxePublicKey,
@@ -455,35 +444,34 @@ async function handleWithdraw(
       nonce
     );
 
-    // Encrypt signature
-    const encryptedSignature = encryptSignature(
-      identity.secretKey,
-      "withdraw",
-      BigInt(amountLamports),
+    // Encrypt current miner state (balance, nonce, reserved) - 3 x u64 ciphertexts
+    const minerState = loadMinerState();
+    const encryptedState = encryptCurrentState(
+      minerState.balance,
+      minerState.stateNonce,
+      minerState.reserved,
       mxePublicKey,
       clientPrivateKey,
       nonce
     );
 
     // Convert to expected format
-    const encryptedMinerIdHashArray: number[][] = encryptedMinerIdHash.map(c => Array.from(c));
     const encryptedAmountArray: number[] = Array.from(encryptedAmount);
     const encryptedDestinationArray: number[][] = encryptedDestination.map(c => Array.from(c));
-    const encryptedSignatureArray: number[][] = encryptedSignature.map(c => Array.from(c));
+    const encryptedCurrentStateArray: number[][] = encryptedState.map(c => Array.from(c));
 
-    // Derive withdraw buffer PDA (using miner wallet)
+    // Derive withdraw buffer PDA (using first 8 bytes of encrypted_amount)
     const [withdrawBufferPda] = PublicKey.findProgramAddressSync(
-      [WITHDRAW_BUFFER_SEED, minerWallet.publicKey.toBuffer(), encryptedMinerIdHash[0].slice(0, 8)],
+      [WITHDRAW_BUFFER_SEED, minerWallet.publicKey.toBuffer(), encryptedAmount.slice(0, 8)],
       POW_PRIVACY_ID
     );
 
     console.log("Creating withdraw buffer...");
     const createBufferTx = await minerProgram.methods
       .createWithdrawBuffer(
-        encryptedMinerIdHashArray,
         encryptedAmountArray,
         encryptedDestinationArray,
-        encryptedSignatureArray,
+        encryptedCurrentStateArray,
         Array.from(clientPublicKey),
         new anchor.BN(deserializeLE(nonce).toString()),
         new anchor.BN(amountLamports),
@@ -1059,93 +1047,8 @@ function setupKeyboardListener(
 }
 
 // ============================================================================
-// MINER IDENTITY MANAGEMENT
-// ============================================================================
-
-interface MinerIdentity {
-  secretKey: Buffer;
-  minerIdHash: Buffer;
-}
-
-function loadOrCreateMinerIdentity(): MinerIdentity {
-  const identityPath = __dirname + "/../miner-identity.json";
-
-  if (fs.existsSync(identityPath)) {
-    const data = JSON.parse(fs.readFileSync(identityPath, "utf-8"));
-    const secretKey = Buffer.from(data.secretKey);
-    const minerIdHash = createHash('sha256').update(secretKey).digest();
-    return { secretKey, minerIdHash };
-  }
-
-  // Generate new identity
-  const secretKey = randomBytes(32);
-  const minerIdHash = createHash('sha256').update(secretKey).digest();
-
-  // Save to file
-  fs.writeFileSync(identityPath, JSON.stringify({
-    secretKey: Array.from(secretKey),
-    note: "This is your miner secret key. Keep it safe! Anyone with this key can withdraw your balance."
-  }, null, 2));
-
-  console.log("Generated new miner identity");
-  console.log("IMPORTANT: Keep miner-identity.json safe! It controls your balance.");
-
-  return { secretKey, minerIdHash };
-}
-
-// ============================================================================
 // ENCRYPTION HELPERS
 // ============================================================================
-
-function encryptMinerIdHash(
-  minerIdHash: Buffer,
-  mxePublicKey: Uint8Array,
-  clientPrivateKey: Uint8Array
-): { ciphertext: Uint8Array[]; nonce: Buffer } {
-  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
-  const cipher = new RescueCipher(sharedSecret);
-  const nonce = randomBytes(16);
-
-  const values = [
-    BigInt("0x" + Buffer.from(minerIdHash.slice(0, 8)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(minerIdHash.slice(8, 16)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(minerIdHash.slice(16, 24)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(minerIdHash.slice(24, 32)).reverse().toString("hex")),
-  ];
-
-  const ciphertextRaw = cipher.encrypt(values, nonce);
-  const ciphertext = ciphertextRaw.map(chunk => Uint8Array.from(chunk));
-
-  return { ciphertext, nonce };
-}
-
-function encryptSignature(
-  secretKey: Buffer,
-  action: string,
-  amount: bigint,
-  mxePublicKey: Uint8Array,
-  clientPrivateKey: Uint8Array,
-  nonce: Buffer
-): Uint8Array[] {
-  const actionBuffer = Buffer.from(action);
-  const amountBuffer = Buffer.alloc(8);
-  amountBuffer.writeBigUInt64LE(amount);
-
-  const signatureInput = Buffer.concat([secretKey, actionBuffer, amountBuffer]);
-  const signature = createHash('sha256').update(signatureInput).digest();
-  const extendedSig = Buffer.concat([signature, createHash('sha256').update(signature).digest()]);
-
-  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
-  const cipher = new RescueCipher(sharedSecret);
-
-  const values: bigint[] = [];
-  for (let i = 0; i < 8; i++) {
-    values.push(BigInt("0x" + Buffer.from(extendedSig.slice(i * 8, (i + 1) * 8)).reverse().toString("hex")));
-  }
-
-  const ciphertextRaw = cipher.encrypt(values, nonce);
-  return ciphertextRaw.map(chunk => Uint8Array.from(chunk));
-}
 
 function encryptDestinationForWithdraw(
   destination: PublicKey,
@@ -1178,6 +1081,46 @@ function encryptAmount(
   const cipher = new RescueCipher(sharedSecret);
   const ciphertextRaw = cipher.encrypt([amount], nonce);
   return Uint8Array.from(ciphertextRaw[0]);
+}
+
+// Encrypt current MinerState (balance, nonce, reserved) - 3 x u64 ciphertexts
+// The miner state is tracked locally and updated after each MPC computation
+function encryptCurrentState(
+  balance: bigint,
+  stateNonce: bigint,
+  reserved: bigint,
+  mxePublicKey: Uint8Array,
+  clientPrivateKey: Uint8Array,
+  nonce: Buffer
+): Uint8Array[] {
+  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
+  const cipher = new RescueCipher(sharedSecret);
+  const ciphertextRaw = cipher.encrypt([balance, stateNonce, reserved], nonce);
+  return ciphertextRaw.map(chunk => Uint8Array.from(chunk));
+}
+
+// Load miner's current encrypted state from local storage
+// Returns {balance, nonce, reserved} - initially all zeros for new miners
+function loadMinerState(): { balance: bigint; stateNonce: bigint; reserved: bigint } {
+  const statePath = __dirname + "/../miner-state.json";
+  if (fs.existsSync(statePath)) {
+    const data = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+    return {
+      balance: BigInt(data.balance || "0"),
+      stateNonce: BigInt(data.nonce || "0"),
+      reserved: BigInt(data.reserved || "0"),
+    };
+  }
+  return { balance: 0n, stateNonce: 0n, reserved: 0n };
+}
+
+function saveMinerState(balance: bigint, stateNonce: bigint, reserved: bigint) {
+  const statePath = __dirname + "/../miner-state.json";
+  fs.writeFileSync(statePath, JSON.stringify({
+    balance: balance.toString(),
+    nonce: stateNonce.toString(),
+    reserved: reserved.toString(),
+  }, null, 2));
 }
 
 // ============================================================================
@@ -1829,8 +1772,10 @@ async function main() {
   const powProtocol = new Program(powProtocolIdl, provider);
   const powPrivacy = new Program(powPrivacyIdl, provider);
 
-  // PDAs - pow-protocol
-  const [powConfig] = PublicKey.findProgramAddressSync([POW_CONFIG_SEED], POW_PROTOCOL_ID);
+  // PDAs - pow-protocol (normal pool = pool_id 0)
+  const [powConfig] = PublicKey.findProgramAddressSync([POW_CONFIG_SEED, Buffer.from([POOL_NORMAL])], POW_PROTOCOL_ID);
+  const [powOtherPool] = PublicKey.findProgramAddressSync([POW_CONFIG_SEED, Buffer.from([POOL_SEEKER])], POW_PROTOCOL_ID);
+  const [powMintAuthority] = PublicKey.findProgramAddressSync([POW_MINT_AUTHORITY_SEED], POW_PROTOCOL_ID);
   const [powFeeVault] = PublicKey.findProgramAddressSync([POW_FEE_VAULT_SEED], POW_PROTOCOL_ID);
 
   // PDAs - pow-privacy
@@ -1849,7 +1794,13 @@ async function main() {
   );
 
   const [privacyMinerStats] = PublicKey.findProgramAddressSync(
-    [POW_MINER_STATS_SEED, privacyAuthority.toBuffer()],
+    [POW_MINER_STATS_SEED, Buffer.from([POOL_NORMAL]), privacyAuthority.toBuffer()],
+    POW_PROTOCOL_ID
+  );
+
+  // Device attestation PDA for privacy_authority
+  const [powAttestation] = PublicKey.findProgramAddressSync(
+    [DEVICE_ATTEST_SEED, privacyAuthority.toBuffer()],
     POW_PROTOCOL_ID
   );
 
@@ -1858,14 +1809,14 @@ async function main() {
     POW_PRIVACY_ID
   );
 
-  const storeClaimOffset = Buffer.from(getCompDefAccOffset("store_claim")).readUInt32LE();
-  const storeClaimCompDef = getCompDefAccAddress(POW_PRIVACY_ID, storeClaimOffset);
+  const mineBlockOffset = Buffer.from(getCompDefAccOffset("mine_block")).readUInt32LE();
+  const mineBlockCompDef = getCompDefAccAddress(POW_PRIVACY_ID, mineBlockOffset);
 
   console.log("PDAs:");
   console.log("  Privacy Config:", privacyConfig.toString());
   console.log("  Privacy Authority:", privacyAuthority.toString());
   console.log("  Sign PDA:", signPdaAccount.toString());
-  console.log("  store_claim CompDef:", storeClaimCompDef.toString());
+  console.log("  mine_block CompDef:", mineBlockCompDef.toString());
   console.log("");
 
   console.log("Account ownership check:");
@@ -1880,7 +1831,7 @@ async function main() {
   await logAccountOwner(connection, "clusterAccount", clusterAccount, ARCIUM_PROGRAM_ID);
   await logAccountOwner(connection, "mempoolAccount", mempoolAccount, ARCIUM_PROGRAM_ID);
   await logAccountOwner(connection, "executingPool", executingPool, ARCIUM_PROGRAM_ID);
-  await logAccountOwner(connection, "compDefAccount(store_claim)", storeClaimCompDef, ARCIUM_PROGRAM_ID);
+  await logAccountOwner(connection, "compDefAccount(store_claim)", mineBlockCompDef, ARCIUM_PROGRAM_ID);
   await logAccountOwner(connection, "feePool", ARCIUM_FEE_POOL, ARCIUM_PROGRAM_ID);
   await logAccountOwner(connection, "clockAccount", ARCIUM_CLOCK, ARCIUM_PROGRAM_ID);
   await logAccountOwner(connection, "signPdaAccount", signPdaAccount, POW_PRIVACY_ID);
@@ -2080,9 +2031,9 @@ async function main() {
       // 4. SUBMIT VIA PRIVACY LAYER
       // =====================================================================
 
-      console.log("Submitting to Arcium MPC (2-transaction flow)...");
+      console.log("Submitting to Arcium MPC...");
 
-      const storeComputationOffset = new anchor.BN(randomBytes(8), "hex");
+      const mineComputationOffset = new anchor.BN(randomBytes(8), "hex");
 
       const [claimPda] = PublicKey.findProgramAddressSync(
         [
@@ -2093,85 +2044,49 @@ async function main() {
         POW_PRIVACY_ID
       );
 
-      const [claimBufferPda] = PublicKey.findProgramAddressSync(
-        [
-          CLAIM_BUFFER_SEED,
-          wallet.publicKey.toBuffer(),
-          secretHash,
-        ],
-        POW_PRIVACY_ID
+      const computationAccount = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, mineComputationOffset);
+
+      // Encrypt destination as [[u8; 32]; 4]
+      const encryptedDestinationArray: number[][] = ciphertext.map(c => Array.from(c));
+
+      // Encrypt current miner state (balance, nonce, reserved) as [[u8; 32]; 3]
+      const minerState = loadMinerState();
+      const encryptedState = encryptCurrentState(
+        minerState.balance,
+        minerState.stateNonce,
+        minerState.reserved,
+        mxePublicKey,
+        clientPrivateKey,
+        nonce
       );
+      const encryptedCurrentStateArray: number[][] = encryptedState.map(c => Array.from(c));
 
-      const computationAccount = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, storeComputationOffset);
-
-      const encryptedClaimBytes: number[] = new Array(4 * 32).fill(0);
-      for (let i = 0; i < ciphertext.length && i < 4; i++) {
-        for (let j = 0; j < 32; j++) {
-          encryptedClaimBytes[i * 32 + j] = ciphertext[i][j];
-        }
-      }
-
-      // TX1: Initialize claim buffer
-      console.log("   TX1: Initializing claim buffer...");
-
-      const initBufferTx = await powPrivacy.methods
-        .initClaimBuffer(
-          Array.from(clientPublicKey),
-          new anchor.BN(deserializeLE(nonce).toString()),
-          Array.from(secretHash)
-        )
-        .accounts({
-          payer: wallet.publicKey,
-          privacyConfig: privacyConfig,
-          claimBuffer: claimBufferPda,
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc({ skipPreflight: true });
-
-      console.log(`   TX1 confirmed: ${initBufferTx.slice(0, 20)}...`);
-
-      // TX2-N: Append encrypted bytes
-      const CHUNK_SIZE = 512;
-      const totalChunks = Math.ceil(encryptedClaimBytes.length / CHUNK_SIZE);
-
-      for (let i = 0; i < totalChunks; i++) {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, encryptedClaimBytes.length);
-        const chunk = encryptedClaimBytes.slice(start, end);
-
-        console.log(`   TX${i + 2}: Appending bytes ${start}-${end} (${chunk.length} bytes)...`);
-
-        const appendTx = await powPrivacy.methods
-          .appendClaimBuffer(Buffer.from(chunk))
-          .accounts({
-            payer: wallet.publicKey,
-            claimBuffer: claimBufferPda,
-          })
-          .rpc({ skipPreflight: true });
-
-        console.log(`   TX${i + 2} confirmed: ${appendTx.slice(0, 20)}...`);
-      }
-
-      // TX: Submit block
-      console.log("   TX2: Submitting block...");
+      console.log("   Submitting block...");
 
       const method = powPrivacy.methods
         .submitBlockPrivate(
-          storeComputationOffset,
+          mineComputationOffset,
           new anchor.BN(result.nonce),
+          Array.from(clientPublicKey),
+          new anchor.BN(deserializeLE(nonce).toString()),
+          Array.from(secretHash),
+          encryptedDestinationArray,
+          encryptedCurrentStateArray,
         )
         .accounts({
           relayer: wallet.publicKey,
           privacyConfig: privacyConfig,
-          claimBuffer: claimBufferPda,
           privacyAuthority: privacyAuthority,
           claim: claimPda,
           sharedTokenVault: sharedTokenVault,
           sharedFeeVault: sharedFeeVault,
           powConfig: powConfig,
+          powOtherPool: powOtherPool,
+          powMintAuthority: powMintAuthority,
           mint: MINT,
           privacyMinerStats: privacyMinerStats,
           powFeeCollector: powFeeVault,
+          powAttestation: powAttestation,
           powProgram: POW_PROTOCOL_ID,
           tokenProgram: tokenProgramId,
           systemProgram: SystemProgram.programId,
@@ -2180,7 +2095,7 @@ async function main() {
           mempoolAccount: mempoolAccount,
           executingPool: executingPool,
           computationAccount: computationAccount,
-          compDefAccount: storeClaimCompDef,
+          compDefAccount: mineBlockCompDef,
           clusterAccount: clusterAccount,
           poolAccount: ARCIUM_FEE_POOL,
           clockAccount: ARCIUM_CLOCK,
@@ -2221,7 +2136,7 @@ async function main() {
           secret,
           destinationWallet as Keypair,
           clientPrivateKey,
-          storeComputationOffset.toBuffer('le', 8),
+          mineComputationOffset.toBuffer('le', 8),
           undefined, // amount unknown at this point
           tx
         );
@@ -2240,7 +2155,7 @@ async function main() {
         destinationWallet: destinationWallet as Keypair,
         destinationPubkey: (destinationWallet as Keypair).publicKey.toString(),
         clientPrivateKey: clientPrivateKey,
-        computationOffset: storeComputationOffset,
+        computationOffset: mineComputationOffset,
         createdAt: Date.now() / 1000,
       });
 
@@ -2252,7 +2167,7 @@ async function main() {
       await printBalanceStatus(connection, sessionBlockCount);
 
       // Non-blocking MPC finalization - update database on completion
-      awaitComputationFinalization(provider, storeComputationOffset, POW_PRIVACY_ID, "confirmed")
+      awaitComputationFinalization(provider, mineComputationOffset, POW_PRIVACY_ID, "confirmed")
         .then((sig) => {
           console.log(`   store_claim #${claimIdNumber} MPC finalized: ${sig.slice(0, 20)}...`);
           claimsDb.markClaimMpcConfirmed(claimIdNumber);

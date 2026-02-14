@@ -1,5 +1,5 @@
 {
-  "address": "HHTo8FEGs8J7VfCD5yDg3ifoKozSaY2cbLfC2U418XjP",
+  "address": "9iC7Ez6VcqG9TvPEZ31szdnhUrsCYBvmj2u9YeDBWErT",
   "metadata": {
     "name": "pow_privacy",
     "version": "0.1.0",
@@ -384,7 +384,7 @@
     {
       "name": "create_deposit_buffer",
       "docs": [
-        "Create a deposit buffer with encrypted miner identification (Step 1)"
+        "Create a deposit buffer with encrypted amount and current state (Step 1)"
       ],
       "discriminator": [
         166,
@@ -438,7 +438,7 @@
           "name": "deposit_buffer",
           "docs": [
             "Deposit buffer PDA",
-            "Derived from owner + encrypted_miner_id_hash to ensure uniqueness"
+            "Derived from owner + encrypted_amount for uniqueness"
           ],
           "writable": true
         },
@@ -449,20 +449,6 @@
       ],
       "args": [
         {
-          "name": "encrypted_miner_id_hash",
-          "type": {
-            "array": [
-              {
-                "array": [
-                  "u8",
-                  32
-                ]
-              },
-              4
-            ]
-          }
-        },
-        {
           "name": "encrypted_amount",
           "type": {
             "array": [
@@ -472,7 +458,7 @@
           }
         },
         {
-          "name": "encrypted_signature",
+          "name": "encrypted_current_state",
           "type": {
             "array": [
               {
@@ -481,7 +467,7 @@
                   32
                 ]
               },
-              8
+              3
             ]
           }
         },
@@ -561,7 +547,7 @@
           "name": "withdraw_buffer",
           "docs": [
             "Withdraw buffer PDA",
-            "Derived from creator + encrypted_miner_id_hash for uniqueness"
+            "Derived from creator + encrypted_amount for uniqueness"
           ],
           "writable": true
         },
@@ -571,20 +557,6 @@
         }
       ],
       "args": [
-        {
-          "name": "encrypted_miner_id_hash",
-          "type": {
-            "array": [
-              {
-                "array": [
-                  "u8",
-                  32
-                ]
-              },
-              4
-            ]
-          }
-        },
         {
           "name": "encrypted_amount",
           "type": {
@@ -609,7 +581,7 @@
           }
         },
         {
-          "name": "encrypted_signature",
+          "name": "encrypted_current_state",
           "type": {
             "array": [
               {
@@ -618,7 +590,7 @@
                   32
                 ]
               },
-              8
+              3
             ]
           }
         },
@@ -1056,6 +1028,14 @@
           "writable": true
         },
         {
+          "name": "address_lookup_table",
+          "writable": true
+        },
+        {
+          "name": "lut_program",
+          "address": "AddressLookupTab1e1111111111111111111111111"
+        },
+        {
           "name": "arcium_program",
           "address": "Arcj82pX7HxYKLR92qvgZUAd7vGS1k4hQvAFcPATFdEQ"
         },
@@ -1366,6 +1346,14 @@
           "writable": true
         },
         {
+          "name": "address_lookup_table",
+          "writable": true
+        },
+        {
+          "name": "lut_program",
+          "address": "AddressLookupTab1e1111111111111111111111111"
+        },
+        {
           "name": "arcium_program",
           "address": "Arcj82pX7HxYKLR92qvgZUAd7vGS1k4hQvAFcPATFdEQ"
         },
@@ -1407,44 +1395,12 @@
           "writable": true
         },
         {
-          "name": "arcium_program",
-          "address": "Arcj82pX7HxYKLR92qvgZUAd7vGS1k4hQvAFcPATFdEQ"
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": []
-    },
-    {
-      "name": "init_store_claim_comp_def",
-      "docs": [
-        "Initialize store_claim computation definition (off-chain circuit)"
-      ],
-      "discriminator": [
-        132,
-        32,
-        2,
-        206,
-        110,
-        130,
-        153,
-        252
-      ],
-      "accounts": [
-        {
-          "name": "payer",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "mxe_account",
+          "name": "address_lookup_table",
           "writable": true
         },
         {
-          "name": "comp_def_account",
-          "writable": true
+          "name": "lut_program",
+          "address": "AddressLookupTab1e1111111111111111111111111"
         },
         {
           "name": "arcium_program",
@@ -1485,6 +1441,14 @@
         {
           "name": "comp_def_account",
           "writable": true
+        },
+        {
+          "name": "address_lookup_table",
+          "writable": true
+        },
+        {
+          "name": "lut_program",
+          "address": "AddressLookupTab1e1111111111111111111111111"
         },
         {
           "name": "arcium_program",
@@ -1528,6 +1492,14 @@
           "writable": true
         },
         {
+          "name": "address_lookup_table",
+          "writable": true
+        },
+        {
+          "name": "lut_program",
+          "address": "AddressLookupTab1e1111111111111111111111111"
+        },
+        {
           "name": "arcium_program",
           "address": "Arcj82pX7HxYKLR92qvgZUAd7vGS1k4hQvAFcPATFdEQ"
         },
@@ -1558,12 +1530,6 @@
           "name": "authority",
           "writable": true,
           "signer": true
-        },
-        {
-          "name": "relayer",
-          "docs": [
-            "The designated relayer"
-          ]
         },
         {
           "name": "mint",
@@ -1764,7 +1730,10 @@
       "name": "mine_block_callback",
       "docs": [
         "Callback for mine_block MPC computation",
-        "Called by Arcium when the balance verification and deduction MPC completes"
+        "Called by Arcium when the balance verification and deduction MPC completes",
+        "",
+        "Note: If the miner had insufficient balance, the MPC circuit would have returned",
+        "success: false and this callback marks verification as failed"
       ],
       "discriminator": [
         1,
@@ -1802,26 +1771,11 @@
           "writable": true
         },
         {
-          "name": "mine_block_buffer",
-          "writable": true
-        },
-        {
-          "name": "shared_fee_vault",
+          "name": "claim",
           "docs": [
-            "Shared fee vault (SOL source)"
+            "The claim to mark as verified"
           ],
           "writable": true
-        },
-        {
-          "name": "pow_fee_vault",
-          "docs": [
-            "PoW protocol fee vault (destination for protocol fee)"
-          ],
-          "writable": true
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
@@ -1846,73 +1800,20 @@
       ]
     },
     {
-      "name": "store_claim_callback",
-      "docs": [
-        "Callback for store_claim MPC computation",
-        "Called by Arcium when the MPC computation completes"
-      ],
-      "discriminator": [
-        40,
-        47,
-        129,
-        160,
-        72,
-        2,
-        59,
-        43
-      ],
-      "accounts": [
-        {
-          "name": "arcium_program",
-          "address": "Arcj82pX7HxYKLR92qvgZUAd7vGS1k4hQvAFcPATFdEQ"
-        },
-        {
-          "name": "comp_def_account"
-        },
-        {
-          "name": "mxe_account"
-        },
-        {
-          "name": "computation_account"
-        },
-        {
-          "name": "cluster_account"
-        },
-        {
-          "name": "instructions_sysvar",
-          "address": "Sysvar1nstructions1111111111111111111111111"
-        },
-        {
-          "name": "privacy_config",
-          "writable": true
-        }
-      ],
-      "args": [
-        {
-          "name": "output",
-          "type": {
-            "defined": {
-              "name": "SignedComputationOutputs",
-              "generics": [
-                {
-                  "kind": "type",
-                  "type": {
-                    "defined": {
-                      "name": "StoreClaimOutput"
-                    }
-                  }
-                }
-              ]
-            }
-          }
-        }
-      ]
-    },
-    {
       "name": "submit_block_private",
       "docs": [
-        "Relayer submits a block with encrypted destination (Transaction 2)",
-        "Reads from claim buffer and queues Arcium MPC computation"
+        "Relayer submits a block with encrypted data directly as parameters",
+        "Verifies PoW, queues MPC computation (mine_block) to verify miner balance,",
+        "then CPIs to pow-protocol to mint tokens",
+        "",
+        "# Arguments",
+        "* `computation_offset` - Arcium computation offset",
+        "* `nonce` - The PoW nonce found by miner",
+        "* `client_pubkey` - x25519 public key for Arcium decryption",
+        "* `encryption_nonce` - Nonce used with RescueCipher",
+        "* `secret_hash` - SHA256 hash of the claim secret",
+        "* `encrypted_destination` - Encrypted destination pubkey (4 x 32 bytes)",
+        "* `encrypted_current_state` - Encrypted miner state (3 x 32 bytes)"
       ],
       "discriminator": [
         165,
@@ -1962,13 +1863,6 @@
               }
             ]
           }
-        },
-        {
-          "name": "claim_buffer",
-          "docs": [
-            "Claim buffer containing encrypted data (created in Transaction 1)"
-          ],
-          "writable": true
         },
         {
           "name": "privacy_authority",
@@ -2118,9 +2012,21 @@
         {
           "name": "pow_config",
           "docs": [
-            "PowConfig from main protocol"
+            "PowConfig from normal pool (pool_id=0) - privacy mines the normal pool"
           ],
           "writable": true
+        },
+        {
+          "name": "pow_other_pool",
+          "docs": [
+            "Other pool PowConfig (seeker pool, pool_id=1) - read-only for supply cap"
+          ]
+        },
+        {
+          "name": "pow_mint_authority",
+          "docs": [
+            "Shared mint authority PDA from pow-protocol"
+          ]
         },
         {
           "name": "mint",
@@ -2142,6 +2048,12 @@
             "Fee collector in pow-protocol"
           ],
           "writable": true
+        },
+        {
+          "name": "pow_attestation",
+          "docs": [
+            "Device attestation PDA for privacy_authority"
+          ]
         },
         {
           "name": "pow_program",
@@ -2221,7 +2133,7 @@
         {
           "name": "comp_def_account",
           "docs": [
-            "Computation definition account for store_claim"
+            "Computation definition account for mine_block"
           ]
         },
         {
@@ -2263,6 +2175,56 @@
         {
           "name": "nonce",
           "type": "u128"
+        },
+        {
+          "name": "client_pubkey",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "encryption_nonce",
+          "type": "u128"
+        },
+        {
+          "name": "secret_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "encrypted_destination",
+          "type": {
+            "array": [
+              {
+                "array": [
+                  "u8",
+                  32
+                ]
+              },
+              4
+            ]
+          }
+        },
+        {
+          "name": "encrypted_current_state",
+          "type": {
+            "array": [
+              {
+                "array": [
+                  "u8",
+                  32
+                ]
+              },
+              3
+            ]
+          }
         }
       ]
     },
@@ -2439,7 +2401,10 @@
       "name": "withdraw_fee_callback",
       "docs": [
         "Callback for withdraw_fee MPC computation",
-        "Called by Arcium when the withdrawal verification MPC completes"
+        "Called by Arcium when the withdrawal verification MPC completes",
+        "",
+        "Note: If the miner had insufficient balance, the MPC circuit would have panicked",
+        "and this callback would never be called (transaction reverts automatically)"
       ],
       "discriminator": [
         25,
@@ -2841,6 +2806,19 @@
       ]
     },
     {
+      "name": "DeviceAttestation",
+      "discriminator": [
+        3,
+        117,
+        146,
+        63,
+        149,
+        136,
+        60,
+        50
+      ]
+    },
+    {
       "name": "EncryptedState",
       "discriminator": [
         40,
@@ -2880,16 +2858,16 @@
       ]
     },
     {
-      "name": "MineBlockBuffer",
+      "name": "MintAuthority",
       "discriminator": [
-        15,
-        116,
-        65,
-        74,
-        238,
-        10,
-        53,
-        165
+        148,
+        0,
+        219,
+        228,
+        254,
+        237,
+        76,
+        128
       ]
     },
     {
@@ -3300,6 +3278,11 @@
       "code": 6028,
       "name": "InsufficientBalance",
       "msg": "Insufficient balance in MPC state"
+    },
+    {
+      "code": 6029,
+      "name": "InsufficientEncryptedBalance",
+      "msg": "Insufficient encrypted balance for mining fee"
     }
   ],
   "types": [
@@ -4090,12 +4073,6 @@
         "kind": "struct",
         "fields": [
           {
-            "name": "relayer",
-            "type": {
-              "option": "pubkey"
-            }
-          },
-          {
             "name": "is_active",
             "type": {
               "option": "bool"
@@ -4108,7 +4085,7 @@
       "name": "DepositBuffer",
       "docs": [
         "Buffer for depositing SOL to miner's encrypted balance",
-        "Used to store encrypted miner_id_hash and amount for Arcium MPC"
+        "Used to store encrypted amount and current state for Arcium MPC"
       ],
       "type": {
         "kind": "struct",
@@ -4128,24 +4105,6 @@
             "type": "u64"
           },
           {
-            "name": "encrypted_miner_id_hash",
-            "docs": [
-              "Encrypted miner_id_hash (4 x 32 bytes = 128 bytes for [u64; 4])",
-              "This is hash(secret_key) encrypted for Arcium"
-            ],
-            "type": {
-              "array": [
-                {
-                  "array": [
-                    "u8",
-                    32
-                  ]
-                },
-                4
-              ]
-            }
-          },
-          {
             "name": "encrypted_amount",
             "docs": [
               "Encrypted amount for MPC (1 x 32 bytes for Enc<Shared, u64>)"
@@ -4158,9 +4117,10 @@
             }
           },
           {
-            "name": "encrypted_signature",
+            "name": "encrypted_current_state",
             "docs": [
-              "Encrypted signature for authentication (8 x 32 = 256 bytes for [u64; 8])"
+              "Encrypted current state (3 x 32 bytes for MinerState: balance, nonce, reserved)",
+              "For new miners, this should be encrypted zeros"
             ],
             "type": {
               "array": [
@@ -4170,7 +4130,7 @@
                     32
                   ]
                 },
-                8
+                3
               ]
             }
           },
@@ -4258,7 +4218,7 @@
                 "generics": [
                   {
                     "kind": "const",
-                    "value": "2"
+                    "value": "5"
                   }
                 ]
               }
@@ -4285,6 +4245,55 @@
               "Timestamp of processing"
             ],
             "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DeviceAttestation",
+      "docs": [
+        "Attestation de device créée par le backend après vérification TEE.",
+        "Valide pendant 60 secondes on-chain.",
+        "Consommée après chaque submit_proof (is_used = true).",
+        "Le mineur doit re-attester avant de soumettre un nouveau bloc."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "miner",
+            "docs": [
+              "Adresse du mineur attesté"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "authority",
+            "docs": [
+              "Authority backend qui a signé l'attestation"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "timestamp",
+            "docs": [
+              "Unix timestamp de création/refresh"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "docs": [
+              "Bump du PDA"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "is_used",
+            "docs": [
+              "Whether this attestation has been consumed by a submit_proof"
+            ],
+            "type": "bool"
           }
         ]
       }
@@ -4468,16 +4477,8 @@
             }
           },
           {
-            "name": "fallback_clusters",
-            "type": {
-              "vec": "u32"
-            }
-          },
-          {
-            "name": "rejected_clusters",
-            "type": {
-              "vec": "u32"
-            }
+            "name": "lut_offset_slot",
+            "type": "u64"
           },
           {
             "name": "computation_definitions",
@@ -4495,147 +4496,6 @@
           },
           {
             "name": "bump",
-            "type": "u8"
-          }
-        ]
-      }
-    },
-    {
-      "name": "MineBlockBuffer",
-      "docs": [
-        "Buffer for mining block with balance verification",
-        "Extends ClaimBuffer with balance-related encrypted data"
-      ],
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "owner",
-            "docs": [
-              "Owner who created this buffer (relayer)"
-            ],
-            "type": "pubkey"
-          },
-          {
-            "name": "encrypted_miner_id_hash",
-            "docs": [
-              "Encrypted miner_id_hash (4 x 32 bytes = 128 bytes for [u64; 4])"
-            ],
-            "type": {
-              "array": [
-                {
-                  "array": [
-                    "u8",
-                    32
-                  ]
-                },
-                4
-              ]
-            }
-          },
-          {
-            "name": "encrypted_protocol_fee",
-            "docs": [
-              "Encrypted protocol fee amount (1 x 32 bytes)"
-            ],
-            "type": {
-              "array": [
-                "u8",
-                32
-              ]
-            }
-          },
-          {
-            "name": "encrypted_destination",
-            "docs": [
-              "Encrypted destination pubkey (4 x 32 = 128 bytes)"
-            ],
-            "type": {
-              "array": [
-                {
-                  "array": [
-                    "u8",
-                    32
-                  ]
-                },
-                4
-              ]
-            }
-          },
-          {
-            "name": "encrypted_signature",
-            "docs": [
-              "Encrypted signature for authentication (8 x 32 = 256 bytes)"
-            ],
-            "type": {
-              "array": [
-                {
-                  "array": [
-                    "u8",
-                    32
-                  ]
-                },
-                8
-              ]
-            }
-          },
-          {
-            "name": "client_pubkey",
-            "docs": [
-              "Client's x25519 public key for Arcium decryption"
-            ],
-            "type": {
-              "array": [
-                "u8",
-                32
-              ]
-            }
-          },
-          {
-            "name": "encryption_nonce",
-            "docs": [
-              "Encryption nonce used with RescueCipher"
-            ],
-            "type": "u128"
-          },
-          {
-            "name": "secret_hash",
-            "docs": [
-              "Hash of the claim secret (SHA256) for claiming rewards"
-            ],
-            "type": {
-              "array": [
-                "u8",
-                32
-              ]
-            }
-          },
-          {
-            "name": "is_used",
-            "docs": [
-              "Whether this buffer has been consumed"
-            ],
-            "type": "bool"
-          },
-          {
-            "name": "balance_verified",
-            "docs": [
-              "Whether balance verification passed"
-            ],
-            "type": "bool"
-          },
-          {
-            "name": "created_at",
-            "docs": [
-              "Creation timestamp"
-            ],
-            "type": "i64"
-          },
-          {
-            "name": "bump",
-            "docs": [
-              "Bump seed"
-            ],
             "type": "u8"
           }
         ]
@@ -4678,11 +4538,27 @@
                 "generics": [
                   {
                     "kind": "const",
-                    "value": "3"
+                    "value": "6"
                   }
                 ]
               }
             }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MintAuthority",
+      "docs": [
+        "Shared mint authority PDA. Both pools use this to sign mint_to CPI calls.",
+        "PDA seeds: [b\"pow_mint_auth\"]"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
           }
         ]
       }
@@ -5119,16 +4995,19 @@
             "type": "u8"
           },
           {
-            "name": "_padding",
+            "name": "attestation_authority",
             "docs": [
-              "Padding pour alignement et futures extensions"
+              "Backend pubkey autorisée à créer des attestations device",
+              "Si Pubkey::default() (all zeros), attestation is disabled"
             ],
-            "type": {
-              "array": [
-                "u8",
-                30
-              ]
-            }
+            "type": "pubkey"
+          },
+          {
+            "name": "pool_id",
+            "docs": [
+              "Pool ID: 0 = normal (open), 1 = seeker (requires TEE attestation)"
+            ],
+            "type": "u8"
           }
         ]
       }
@@ -5152,13 +5031,6 @@
             "name": "mint",
             "docs": [
               "Token mint (HASH token)"
-            ],
-            "type": "pubkey"
-          },
-          {
-            "name": "relayer",
-            "docs": [
-              "Relayer pubkey (authorized to submit blocks)"
             ],
             "type": "pubkey"
           },
@@ -5242,12 +5114,6 @@
         "kind": "struct",
         "fields": [
           {
-            "name": "relayer",
-            "type": {
-              "option": "pubkey"
-            }
-          },
-          {
             "name": "is_active",
             "type": {
               "option": "bool"
@@ -5267,10 +5133,6 @@
           },
           {
             "name": "authority",
-            "type": "pubkey"
-          },
-          {
-            "name": "relayer",
             "type": "pubkey"
           },
           {
@@ -5431,32 +5293,6 @@
       }
     },
     {
-      "name": "StoreClaimOutput",
-      "docs": [
-        "The output of the callback instruction. Provided as a struct with ordered fields",
-        "as anchor does not support tuples and tuple structs yet."
-      ],
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "field_0",
-            "type": {
-              "defined": {
-                "name": "SharedEncryptedStruct",
-                "generics": [
-                  {
-                    "kind": "const",
-                    "value": "1"
-                  }
-                ]
-              }
-            }
-          }
-        ]
-      }
-    },
-    {
       "name": "Timestamp",
       "type": {
         "kind": "struct",
@@ -5562,23 +5398,6 @@
             "type": "u64"
           },
           {
-            "name": "encrypted_miner_id_hash",
-            "docs": [
-              "Encrypted miner_id_hash (4 x 32 bytes = 128 bytes for [u64; 4])"
-            ],
-            "type": {
-              "array": [
-                {
-                  "array": [
-                    "u8",
-                    32
-                  ]
-                },
-                4
-              ]
-            }
-          },
-          {
             "name": "encrypted_amount",
             "docs": [
               "Encrypted amount for MPC (1 x 32 bytes for Enc<Shared, u64>)"
@@ -5609,9 +5428,9 @@
             }
           },
           {
-            "name": "encrypted_signature",
+            "name": "encrypted_current_state",
             "docs": [
-              "Encrypted signature for authentication (8 x 32 = 256 bytes)"
+              "Encrypted current state (3 x 32 bytes for MinerState: balance, nonce, reserved)"
             ],
             "type": {
               "array": [
@@ -5621,7 +5440,7 @@
                     32
                   ]
                 },
-                8
+                3
               ]
             }
           },
@@ -5730,7 +5549,7 @@
                 "generics": [
                   {
                     "kind": "const",
-                    "value": "7"
+                    "value": "10"
                   }
                 ]
               }

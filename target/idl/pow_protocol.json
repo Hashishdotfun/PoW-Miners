@@ -1,5 +1,5 @@
 {
-  "address": "6DEmqXKEokfBz2wiREVthwbkDECvrWorkJNd48duatL2",
+  "address": "Ai9XrxSUmDLNCXkoeoqnYuzPgN9F2PeF9WtLq9GyqER",
   "metadata": {
     "name": "pow_protocol",
     "version": "0.1.0",
@@ -42,26 +42,7 @@
           "docs": [
             "Configuration du protocole"
           ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  119,
-                  95,
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
+          "writable": true
         }
       ],
       "args": [
@@ -107,26 +88,7 @@
           "name": "pow_config",
           "docs": [
             "Configuration du protocole (pour vérifier l'autorité)"
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  119,
-                  95,
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
+          ]
         },
         {
           "name": "team_vault",
@@ -176,6 +138,87 @@
       ]
     },
     {
+      "name": "create_attestation",
+      "docs": [
+        "Crée ou rafraîchit une attestation device",
+        "",
+        "Le backend vérifie le hardware TEE du Seeker, puis co-signe cette",
+        "transaction. L'attestation est valide 60 secondes on-chain.",
+        "Le miner paie le rent (première fois) et les tx fees."
+      ],
+      "discriminator": [
+        49,
+        24,
+        67,
+        80,
+        12,
+        249,
+        96,
+        239
+      ],
+      "accounts": [
+        {
+          "name": "miner",
+          "docs": [
+            "Le mineur (paye le rent si première création)"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "authority",
+          "docs": [
+            "L'authority backend qui a vérifié le device TEE"
+          ],
+          "signer": true
+        },
+        {
+          "name": "pow_config",
+          "docs": [
+            "PowConfig de la pool seeker (contient l'attestation_authority)"
+          ]
+        },
+        {
+          "name": "attestation",
+          "docs": [
+            "L'attestation PDA (créée ou mise à jour)"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  101,
+                  118,
+                  105,
+                  99,
+                  101,
+                  95,
+                  97,
+                  116,
+                  116,
+                  101,
+                  115,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "miner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "distribute_fees",
       "docs": [
         "Distribue les fees SOL accumulées",
@@ -216,26 +259,7 @@
           "docs": [
             "Configuration du protocole"
           ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  119,
-                  95,
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
+          "writable": true
         },
         {
           "name": "fee_collector",
@@ -381,26 +405,7 @@
         },
         {
           "name": "pow_config",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  119,
-                  95,
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
+          "writable": true
         },
         {
           "name": "mint",
@@ -460,14 +465,20 @@
         {
           "name": "mint",
           "docs": [
-            "Le mint du token SPL2022",
-            "On vérifie qu'il a bien 9 décimales"
+            "Le mint du token SPL2022"
           ]
         },
         {
           "name": "pow_config",
           "docs": [
-            "Configuration principale du protocole (PDA)"
+            "Configuration de la pool (PDA avec pool_id)"
+          ],
+          "writable": true
+        },
+        {
+          "name": "mint_authority",
+          "docs": [
+            "Shared mint authority (created on first call, reused on second)"
           ],
           "writable": true,
           "pda": {
@@ -479,12 +490,15 @@
                   111,
                   119,
                   95,
-                  99,
-                  111,
-                  110,
-                  102,
+                  109,
                   105,
-                  103
+                  110,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104
                 ]
               }
             ]
@@ -493,7 +507,7 @@
         {
           "name": "pow_vault",
           "docs": [
-            "Vault pour stocker les tokens (rewards pour mineurs)"
+            "Vault pour stocker les tokens (shared, created on first call)"
           ],
           "writable": true,
           "pda": {
@@ -522,7 +536,7 @@
         {
           "name": "team_vault",
           "docs": [
-            "Vault pour collecter les fees team"
+            "Vault pour collecter les fees team (shared, created on first call)"
           ],
           "writable": true,
           "pda": {
@@ -559,7 +573,12 @@
           "address": "11111111111111111111111111111111"
         }
       ],
-      "args": []
+      "args": [
+        {
+          "name": "pool_id",
+          "type": "u8"
+        }
+      ]
     },
     {
       "name": "record_transfer_burn",
@@ -594,26 +613,7 @@
           "docs": [
             "Configuration du protocole"
           ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  119,
-                  95,
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
+          "writable": true
         }
       ],
       "args": [
@@ -670,9 +670,21 @@
         {
           "name": "pow_config",
           "docs": [
-            "Configuration du protocole"
+            "Configuration de la pool minée (writable)"
           ],
-          "writable": true,
+          "writable": true
+        },
+        {
+          "name": "other_pool",
+          "docs": [
+            "L'autre pool (read-only, pour vérifier le supply cap combiné)"
+          ]
+        },
+        {
+          "name": "mint_authority",
+          "docs": [
+            "Shared mint authority (signe les mint_to CPI)"
+          ],
           "pda": {
             "seeds": [
               {
@@ -682,12 +694,15 @@
                   111,
                   119,
                   95,
-                  99,
-                  111,
-                  110,
-                  102,
+                  109,
                   105,
-                  103
+                  110,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104
                 ]
               }
             ]
@@ -713,38 +728,14 @@
         {
           "name": "miner_stats",
           "docs": [
-            "Statistiques du mineur (PDA)"
+            "Statistiques du mineur pour cette pool (PDA)"
           ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  109,
-                  105,
-                  110,
-                  101,
-                  114,
-                  95,
-                  115,
-                  116,
-                  97,
-                  116,
-                  115
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "miner"
-              }
-            ]
-          }
+          "writable": true
         },
         {
           "name": "fee_collector",
           "docs": [
-            "Compte qui collecte les fees (PDA du programme)"
+            "Compte qui collecte les fees (PDA du programme, partagé)"
           ],
           "writable": true,
           "pda": {
@@ -762,6 +753,40 @@
                   108,
                   116
                 ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "attestation",
+          "docs": [
+            "Attestation device du mineur (optionnel, requis uniquement pour la pool seeker)"
+          ],
+          "writable": true,
+          "optional": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  101,
+                  118,
+                  105,
+                  99,
+                  101,
+                  95,
+                  97,
+                  116,
+                  116,
+                  101,
+                  115,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "miner"
               }
             ]
           }
@@ -824,26 +849,7 @@
           "docs": [
             "Configuration du protocole"
           ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  119,
-                  95,
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
+          "writable": true
         }
       ],
       "args": []
@@ -886,26 +892,7 @@
           "docs": [
             "Configuration du protocole"
           ],
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  119,
-                  95,
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
+          "writable": true
         }
       ],
       "args": [
@@ -1041,6 +1028,19 @@
   ],
   "accounts": [
     {
+      "name": "DeviceAttestation",
+      "discriminator": [
+        3,
+        117,
+        146,
+        63,
+        149,
+        136,
+        60,
+        50
+      ]
+    },
+    {
       "name": "MinerStats",
       "discriminator": [
         112,
@@ -1051,6 +1051,19 @@
         210,
         252,
         208
+      ]
+    },
+    {
+      "name": "MintAuthority",
+      "discriminator": [
+        148,
+        0,
+        219,
+        228,
+        254,
+        237,
+        76,
+        128
       ]
     },
     {
@@ -1240,9 +1253,83 @@
       "code": 6031,
       "name": "AccountAlreadyExists",
       "msg": "Account already exists"
+    },
+    {
+      "code": 6032,
+      "name": "AttestationExpired",
+      "msg": "Device attestation expired (>60s)"
+    },
+    {
+      "code": 6033,
+      "name": "InvalidAttestationAuthority",
+      "msg": "Invalid attestation authority"
+    },
+    {
+      "code": 6034,
+      "name": "AttestationRequired",
+      "msg": "Device attestation required but not provided"
+    },
+    {
+      "code": 6035,
+      "name": "AttestationAlreadyUsed",
+      "msg": "Attestation already used, re-attest before submitting another proof"
+    },
+    {
+      "code": 6036,
+      "name": "InvalidPoolId",
+      "msg": "Invalid pool ID"
     }
   ],
   "types": [
+    {
+      "name": "DeviceAttestation",
+      "docs": [
+        "Attestation de device créée par le backend après vérification TEE.",
+        "Valide pendant 60 secondes on-chain.",
+        "Consommée après chaque submit_proof (is_used = true).",
+        "Le mineur doit re-attester avant de soumettre un nouveau bloc."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "miner",
+            "docs": [
+              "Adresse du mineur attesté"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "authority",
+            "docs": [
+              "Authority backend qui a signé l'attestation"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "timestamp",
+            "docs": [
+              "Unix timestamp de création/refresh"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "docs": [
+              "Bump du PDA"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "is_used",
+            "docs": [
+              "Whether this attestation has been consumed by a submit_proof"
+            ],
+            "type": "bool"
+          }
+        ]
+      }
+    },
     {
       "name": "MinerStats",
       "docs": [
@@ -1298,6 +1385,29 @@
             "docs": [
               "Bump du PDA"
             ],
+            "type": "u8"
+          },
+          {
+            "name": "pool_id",
+            "docs": [
+              "Pool ID (0 = normal, 1 = seeker)"
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MintAuthority",
+      "docs": [
+        "Shared mint authority PDA. Both pools use this to sign mint_to CPI calls.",
+        "PDA seeds: [b\"pow_mint_auth\"]"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
             "type": "u8"
           }
         ]
@@ -1485,16 +1595,19 @@
             "type": "u8"
           },
           {
-            "name": "_padding",
+            "name": "attestation_authority",
             "docs": [
-              "Padding pour alignement et futures extensions"
+              "Backend pubkey autorisée à créer des attestations device",
+              "Si Pubkey::default() (all zeros), attestation is disabled"
             ],
-            "type": {
-              "array": [
-                "u8",
-                30
-              ]
-            }
+            "type": "pubkey"
+          },
+          {
+            "name": "pool_id",
+            "docs": [
+              "Pool ID: 0 = normal (open), 1 = seeker (requires TEE attestation)"
+            ],
+            "type": "u8"
           }
         ]
       }
@@ -1547,6 +1660,16 @@
             ],
             "type": {
               "option": "bool"
+            }
+          },
+          {
+            "name": "attestation_authority",
+            "docs": [
+              "Backend pubkey autorisée à créer des attestations device",
+              "Set to Some(Pubkey::default()) to disable attestation requirement"
+            ],
+            "type": {
+              "option": "pubkey"
             }
           }
         ]

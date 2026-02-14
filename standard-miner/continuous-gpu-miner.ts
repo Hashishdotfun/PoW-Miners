@@ -34,6 +34,12 @@ const MINT = new PublicKey(config.mint);
 const POW_CONFIG_SEED = Buffer.from("pow_config");
 const FEE_VAULT_SEED = Buffer.from("fee_vault");
 const MINER_STATS_SEED = Buffer.from("miner_stats");
+const MINT_AUTHORITY_SEED = Buffer.from("pow_mint_auth");
+const DEVICE_ATTEST_SEED = Buffer.from("device_attest");
+
+// Pool IDs
+const POOL_NORMAL: number = 0;
+const POOL_SEEKER: number = 1;
 
 // ============================================================================
 // GPU MINING via Rust miner
@@ -113,9 +119,19 @@ async function main() {
 
   const program = new Program(idl, provider);
 
-  // PDAs
+  // PDAs (normal pool = pool_id 0)
   const [powConfig] = PublicKey.findProgramAddressSync(
-    [POW_CONFIG_SEED],
+    [POW_CONFIG_SEED, Buffer.from([POOL_NORMAL])],
+    POW_PROTOCOL_ID
+  );
+
+  const [otherPool] = PublicKey.findProgramAddressSync(
+    [POW_CONFIG_SEED, Buffer.from([POOL_SEEKER])],
+    POW_PROTOCOL_ID
+  );
+
+  const [mintAuthority] = PublicKey.findProgramAddressSync(
+    [MINT_AUTHORITY_SEED],
     POW_PROTOCOL_ID
   );
 
@@ -125,7 +141,12 @@ async function main() {
   );
 
   const [minerStats] = PublicKey.findProgramAddressSync(
-    [MINER_STATS_SEED, wallet.publicKey.toBuffer()],
+    [MINER_STATS_SEED, Buffer.from([POOL_NORMAL]), wallet.publicKey.toBuffer()],
+    POW_PROTOCOL_ID
+  );
+
+  const [attestation] = PublicKey.findProgramAddressSync(
+    [DEVICE_ATTEST_SEED, wallet.publicKey.toBuffer()],
     POW_PROTOCOL_ID
   );
 
@@ -228,13 +249,16 @@ async function main() {
         .accounts({
           miner: wallet.publicKey,
           powConfig: powConfig,
+          otherPool: otherPool,
+          mintAuthority: mintAuthority,
           mint: MINT,
           minerTokenAccount: minerTokenAccount,
           minerStats: minerStats,
           feeCollector: feeVault,
+          attestation: null,
           tokenProgram: TOKEN_2022_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
-        })
+        } as any)
         .rpc();
 
       await connection.confirmTransaction(tx, "confirmed");

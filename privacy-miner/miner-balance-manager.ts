@@ -32,7 +32,7 @@ import {
   getFeePoolAccAddress,
   getClockAccAddress,
 } from "@arcium-hq/client";
-import { createHash, randomBytes } from 'crypto';
+import { randomBytes } from 'crypto';
 import fs from "fs";
 
 // Config
@@ -43,7 +43,7 @@ const configPath = useLocal
 const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
 // Program IDs
-const POW_PRIVACY_ID = new PublicKey("HHTo8FEGs8J7VfCD5yDg3ifoKozSaY2cbLfC2U418XjP");
+const POW_PRIVACY_ID = new PublicKey("9iC7Ez6VcqG9TvPEZ31szdnhUrsCYBvmj2u9YeDBWErT");
 
 // Arcium cluster offset
 const DEFAULT_CLUSTER_OFFSET = 456;
@@ -64,98 +64,51 @@ const WITHDRAW_BUFFER_SEED = Buffer.from("withdraw_buffer");
 const SIGN_PDA_SEED = Buffer.from("ArciumSignerAccount");
 
 // ============================================================================
-// MINER ID MANAGEMENT
+// MINER STATE MANAGEMENT
 // ============================================================================
 
-interface MinerIdentity {
-  secretKey: Buffer;       // 32-byte secret key (never shared)
-  minerIdHash: Buffer;     // SHA256(secretKey) - used as miner identifier
-}
-
-function loadOrCreateMinerIdentity(): MinerIdentity {
-  const identityPath = __dirname + "/../miner-identity.json";
-
-  if (fs.existsSync(identityPath)) {
-    const data = JSON.parse(fs.readFileSync(identityPath, "utf-8"));
-    const secretKey = Buffer.from(data.secretKey);
-    const minerIdHash = createHash('sha256').update(secretKey).digest();
-    console.log("Loaded existing miner identity");
-    return { secretKey, minerIdHash };
+function loadMinerState(): { balance: bigint; stateNonce: bigint; reserved: bigint } {
+  const statePath = __dirname + "/../miner-state.json";
+  if (fs.existsSync(statePath)) {
+    const data = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+    return {
+      balance: BigInt(data.balance || "0"),
+      stateNonce: BigInt(data.nonce || "0"),
+      reserved: BigInt(data.reserved || "0"),
+    };
   }
-
-  // Generate new identity
-  const secretKey = randomBytes(32);
-  const minerIdHash = createHash('sha256').update(secretKey).digest();
-
-  // Save to file (KEEP THIS SECRET!)
-  fs.writeFileSync(identityPath, JSON.stringify({
-    secretKey: Array.from(secretKey),
-    note: "This is your miner secret key. Keep it safe! Anyone with this key can withdraw your balance."
-  }, null, 2));
-
-  console.log("Generated new miner identity");
-  console.log("IMPORTANT: Keep miner-identity.json safe! It controls your balance.");
-
-  return { secretKey, minerIdHash };
+  return { balance: 0n, stateNonce: 0n, reserved: 0n };
 }
 
 // ============================================================================
 // ENCRYPTION HELPERS
 // ============================================================================
 
-function encryptMinerIdHash(
-  minerIdHash: Buffer,
-  mxePublicKey: Uint8Array,
-  clientPrivateKey: Uint8Array
-): { ciphertext: Uint8Array[]; nonce: Buffer } {
-  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
-  const cipher = new RescueCipher(sharedSecret);
-  const nonce = randomBytes(16);
-
-  // Convert 32-byte hash to 4 x 64-bit values
-  const values = [
-    BigInt("0x" + Buffer.from(minerIdHash.slice(0, 8)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(minerIdHash.slice(8, 16)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(minerIdHash.slice(16, 24)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(minerIdHash.slice(24, 32)).reverse().toString("hex")),
-  ];
-
-  const ciphertextRaw = cipher.encrypt(values, nonce);
-  const ciphertext = ciphertextRaw.map(chunk => Uint8Array.from(chunk));
-
-  return { ciphertext, nonce };
-}
-
-function encryptSignature(
-  secretKey: Buffer,
-  action: string,  // "deposit" | "withdraw"
+function encryptAmount(
   amount: bigint,
   mxePublicKey: Uint8Array,
   clientPrivateKey: Uint8Array,
   nonce: Buffer
-): Uint8Array[] {
-  // Create a signature: SHA256(secretKey || action || amount)
-  const actionBuffer = Buffer.from(action);
-  const amountBuffer = Buffer.alloc(8);
-  amountBuffer.writeBigUInt64LE(amount);
-
-  const signatureInput = Buffer.concat([secretKey, actionBuffer, amountBuffer]);
-  const signature = createHash('sha256').update(signatureInput).digest();
-
-  // Extend to 64 bytes (2 x 32 bytes = 8 x u64)
-  const extendedSig = Buffer.concat([signature, createHash('sha256').update(signature).digest()]);
-
+): Uint8Array {
   const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
   const cipher = new RescueCipher(sharedSecret);
+  const ciphertextRaw = cipher.encrypt([amount], nonce);
+  return Uint8Array.from(ciphertextRaw[0]);
+}
 
-  // Convert 64-byte signature to 8 x 64-bit values
-  const values: bigint[] = [];
-  for (let i = 0; i < 8; i++) {
-    values.push(BigInt("0x" + Buffer.from(extendedSig.slice(i * 8, (i + 1) * 8)).reverse().toString("hex")));
-  }
-
-  const ciphertextRaw = cipher.encrypt(values, nonce);
-  return ciphertextRaw.map(chunk => Uint8Array.from(chunk));
+// Encrypt current MinerState (balance, nonce, reserved) - 3 x u64 ciphertexts
+function encryptCurrentState(
+  balance: bigint,
+  stateNonce: bigint,
+  reserved: bigint,
+  mxePublicKey: Uint8Array,
+  clientPrivateKey: Uint8Array,
+  nonce: Buffer
+): Uint8Array[] {
+  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
+  const cipher = new RescueCipher(sharedSecret);
+  const ciphertextRaw = cipher.encrypt([balance, stateNonce, reserved], nonce);
+  return ciphertextRaw.map((chunk: any) => Uint8Array.from(chunk));
 }
 
 function encryptDestination(
@@ -169,27 +122,14 @@ function encryptDestination(
 
   const destBytes = destination.toBuffer();
   const values = [
-    BigInt("0x" + Buffer.from(destBytes.slice(0, 8)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(destBytes.slice(8, 16)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(destBytes.slice(16, 24)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(destBytes.slice(24, 32)).reverse().toString("hex")),
+    BigInt("0x" + Buffer.from(destBytes.subarray(0, 8)).reverse().toString("hex")),
+    BigInt("0x" + Buffer.from(destBytes.subarray(8, 16)).reverse().toString("hex")),
+    BigInt("0x" + Buffer.from(destBytes.subarray(16, 24)).reverse().toString("hex")),
+    BigInt("0x" + Buffer.from(destBytes.subarray(24, 32)).reverse().toString("hex")),
   ];
 
   const ciphertextRaw = cipher.encrypt(values, nonce);
-  return ciphertextRaw.map(chunk => Uint8Array.from(chunk));
-}
-
-function encryptAmount(
-  amount: bigint,
-  mxePublicKey: Uint8Array,
-  clientPrivateKey: Uint8Array,
-  nonce: Buffer
-): Uint8Array {
-  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
-  const cipher = new RescueCipher(sharedSecret);
-
-  const ciphertextRaw = cipher.encrypt([amount], nonce);
-  return Uint8Array.from(ciphertextRaw[0]);
+  return ciphertextRaw.map((chunk: any) => Uint8Array.from(chunk));
 }
 
 // ============================================================================
@@ -212,18 +152,11 @@ async function deposit(
 ) {
   console.log(`\nDepositing ${amount} lamports (${amount / 1e9} SOL)...`);
 
-  const identity = loadOrCreateMinerIdentity();
   const clientPrivateKey = x25519.utils.randomSecretKey();
   const clientPublicKey = x25519.getPublicKey(clientPrivateKey);
+  const nonce = randomBytes(16);
 
-  // Encrypt miner_id_hash
-  const { ciphertext: encryptedMinerIdHash, nonce } = encryptMinerIdHash(
-    identity.minerIdHash,
-    mxePublicKey,
-    clientPrivateKey
-  );
-
-  // Encrypt amount
+  // Encrypt amount (single u64 ciphertext)
   const encryptedAmount = encryptAmount(
     BigInt(amount),
     mxePublicKey,
@@ -231,27 +164,27 @@ async function deposit(
     nonce
   );
 
-  // Encrypt signature
-  const encryptedSignature = encryptSignature(
-    identity.secretKey,
-    "deposit",
-    BigInt(amount),
+  // Encrypt current miner state (balance, nonce, reserved) - 3 x u64 ciphertexts
+  const minerState = loadMinerState();
+  const encryptedState = encryptCurrentState(
+    minerState.balance,
+    minerState.stateNonce,
+    minerState.reserved,
     mxePublicKey,
     clientPrivateKey,
     nonce
   );
 
-  // Convert to expected format (4 x 32-byte arrays for miner_id_hash, 8 x 32-byte arrays for signature)
-  const encryptedMinerIdHashArray: number[][] = encryptedMinerIdHash.map(c => Array.from(c));
+  // Convert to expected format
   const encryptedAmountArray: number[] = Array.from(encryptedAmount);
-  const encryptedSignatureArray: number[][] = encryptedSignature.map(c => Array.from(c));
+  const encryptedCurrentStateArray: number[][] = encryptedState.map(c => Array.from(c));
 
-  // Derive deposit buffer PDA
+  // Derive deposit buffer PDA (using first 8 bytes of encrypted_amount)
   const [depositBufferPda] = PublicKey.findProgramAddressSync(
     [
       DEPOSIT_BUFFER_SEED,
       wallet.publicKey.toBuffer(),
-      encryptedMinerIdHash[0].slice(0, 8),
+      encryptedAmount.slice(0, 8),
     ],
     POW_PRIVACY_ID
   );
@@ -261,9 +194,8 @@ async function deposit(
   // Step 1: Create deposit buffer
   const createBufferTx = await program.methods
     .createDepositBuffer(
-      encryptedMinerIdHashArray,
       encryptedAmountArray,
-      encryptedSignatureArray,
+      encryptedCurrentStateArray,
       Array.from(clientPublicKey),
       new anchor.BN(deserializeLE(nonce).toString()),
       new anchor.BN(amount),
@@ -356,18 +288,11 @@ async function withdraw(
   console.log(`\nWithdrawing ${amount} lamports (${amount / 1e9} SOL)...`);
   console.log(`Destination: ${destination.toString()}`);
 
-  const identity = loadOrCreateMinerIdentity();
   const clientPrivateKey = x25519.utils.randomSecretKey();
   const clientPublicKey = x25519.getPublicKey(clientPrivateKey);
+  const nonce = randomBytes(16);
 
-  // Encrypt miner_id_hash
-  const { ciphertext: encryptedMinerIdHash, nonce } = encryptMinerIdHash(
-    identity.minerIdHash,
-    mxePublicKey,
-    clientPrivateKey
-  );
-
-  // Encrypt amount
+  // Encrypt amount (single u64 ciphertext)
   const encryptedAmount = encryptAmount(
     BigInt(amount),
     mxePublicKey,
@@ -375,36 +300,36 @@ async function withdraw(
     nonce
   );
 
-  // Encrypt destination
-  const encryptedDestination = encryptDestination(
+  // Encrypt destination (4 x u64 ciphertexts)
+  const encryptedDest = encryptDestination(
     destination,
     mxePublicKey,
     clientPrivateKey,
     nonce
   );
 
-  // Encrypt signature
-  const encryptedSignature = encryptSignature(
-    identity.secretKey,
-    "withdraw",
-    BigInt(amount),
+  // Encrypt current miner state (balance, nonce, reserved) - 3 x u64 ciphertexts
+  const minerState = loadMinerState();
+  const encryptedState = encryptCurrentState(
+    minerState.balance,
+    minerState.stateNonce,
+    minerState.reserved,
     mxePublicKey,
     clientPrivateKey,
     nonce
   );
 
   // Convert to expected format
-  const encryptedMinerIdHashArray: number[][] = encryptedMinerIdHash.map(c => Array.from(c));
   const encryptedAmountArray: number[] = Array.from(encryptedAmount);
-  const encryptedDestinationArray: number[][] = encryptedDestination.map(c => Array.from(c));
-  const encryptedSignatureArray: number[][] = encryptedSignature.map(c => Array.from(c));
+  const encryptedDestinationArray: number[][] = encryptedDest.map((c: Uint8Array) => Array.from(c));
+  const encryptedCurrentStateArray: number[][] = encryptedState.map((c: Uint8Array) => Array.from(c));
 
-  // Derive withdraw buffer PDA
+  // Derive withdraw buffer PDA (using first 8 bytes of encrypted_amount)
   const [withdrawBufferPda] = PublicKey.findProgramAddressSync(
     [
       WITHDRAW_BUFFER_SEED,
       wallet.publicKey.toBuffer(),
-      encryptedMinerIdHash[0].slice(0, 8),
+      encryptedAmount.slice(0, 8),
     ],
     POW_PRIVACY_ID
   );
@@ -414,10 +339,9 @@ async function withdraw(
   // Step 1: Create withdraw buffer
   const createBufferTx = await program.methods
     .createWithdrawBuffer(
-      encryptedMinerIdHashArray,
       encryptedAmountArray,
       encryptedDestinationArray,
-      encryptedSignatureArray,
+      encryptedCurrentStateArray,
       Array.from(clientPublicKey),
       new anchor.BN(deserializeLE(nonce).toString()),
       new anchor.BN(amount),
@@ -569,12 +493,13 @@ async function main() {
       amount, destination
     );
   } else if (command === "status") {
-    const identity = loadOrCreateMinerIdentity();
-    console.log("\nMiner Identity:");
-    console.log(`  ID Hash: ${identity.minerIdHash.toString("hex").slice(0, 16)}...`);
+    const minerState = loadMinerState();
+    console.log("\nMiner State (local):");
+    console.log(`  Balance: ${minerState.balance.toString()} lamports`);
+    console.log(`  Nonce: ${minerState.stateNonce.toString()}`);
+    console.log(`  Reserved: ${minerState.reserved.toString()}`);
     console.log("\nNote: Your encrypted balance is stored in Arcium MPC.");
-    console.log("There is no on-chain way to check it directly.");
-    console.log("Your balance is the sum of deposits minus withdrawals and mining fees.");
+    console.log("The local state is a cache - the MPC state is authoritative.");
 
     // Show shared vault balance
     const vaultBalance = await connection.getBalance(sharedFeeVault);
