@@ -16,6 +16,7 @@ miner-config-mainnet.json
 *.keypair
 wallets-privacy/
 miner-identity.json
+keys/
 
 # Database (claims, settings)
 data/

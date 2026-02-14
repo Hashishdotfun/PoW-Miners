@@ -43,7 +43,7 @@ const configPath = useLocal
 const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
 // Program IDs
-const POW_PRIVACY_ID = new PublicKey("9iC7Ez6VcqG9TvPEZ31szdnhUrsCYBvmj2u9YeDBWErT");
+const POW_PRIVACY_ID = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
 
 // Arcium cluster offset
 const DEFAULT_CLUSTER_OFFSET = 456;

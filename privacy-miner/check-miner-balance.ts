@@ -30,7 +30,7 @@ try {
 }
 
 // Program IDs
-const POW_PRIVACY_ID = new PublicKey("9iC7Ez6VcqG9TvPEZ31szdnhUrsCYBvmj2u9YeDBWErT");
+const POW_PRIVACY_ID = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
 
 // Seeds
 const PRIVACY_CONFIG_SEED = Buffer.from("privacy_config");

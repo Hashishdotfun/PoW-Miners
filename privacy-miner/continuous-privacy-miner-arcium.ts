@@ -24,7 +24,15 @@
 
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { PublicKey, Keypair, SystemProgram, ComputeBudgetProgram } from "@solana/web3.js";
+import {
+  PublicKey,
+  Keypair,
+  SystemProgram,
+  ComputeBudgetProgram,
+  TransactionMessage,
+  VersionedTransaction,
+  AddressLookupTableAccount
+} from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -46,6 +54,7 @@ import {
   getArciumProgramId,
   getFeePoolAccAddress,
   getClockAccAddress,
+  getLookupTableAddress,
 } from "@arcium-hq/client";
 import { spawn, ChildProcess } from 'child_process';
 import { createHash, randomBytes } from 'crypto';
@@ -57,6 +66,55 @@ import * as claimsDb from "./claims-db";
 // Track the current mining process so we can kill it when menu opens
 let currentMiningProcess: ChildProcess | null = null;
 
+// Track miner's encrypted balance locally
+// This is a local copy - the canonical balance is in Arcium MPC
+let minerBalanceLamports: bigint = BigInt(0);
+
+// Balance tracking functions
+function loadMinerBalance(): bigint {
+  const balancePath = __dirname + "/../miner-balance.json";
+  if (fs.existsSync(balancePath)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(balancePath, "utf-8"));
+      return BigInt(data.balance || 0);
+    } catch (e) {
+      return BigInt(0);
+    }
+  }
+  return BigInt(0);
+}
+
+function saveMinerBalance(balance: bigint): void {
+  const balancePath = __dirname + "/../miner-balance.json";
+  fs.writeFileSync(balancePath, JSON.stringify({
+    balance: balance.toString(),
+    updatedAt: new Date().toISOString(),
+  }, null, 2));
+}
+
+// Encrypt MinerState (balance, nonce, reserved) for MPC
+// Returns 3 ciphertexts for the 3 u64 fields
+function encryptMinerState(
+  balance: bigint,
+  stateNonce: bigint,
+  reserved: bigint,
+  mxePublicKey: Uint8Array,
+  clientPrivateKey: Uint8Array,
+  nonce: Buffer
+): Uint8Array[] {
+  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
+  const cipher = new RescueCipher(sharedSecret);
+  // Encrypt each field separately as u64
+  const balanceCiphertext = cipher.encrypt([balance], nonce);
+  const nonceCiphertext = cipher.encrypt([stateNonce], nonce);
+  const reservedCiphertext = cipher.encrypt([reserved], nonce);
+  return [
+    Uint8Array.from(balanceCiphertext[0]),
+    Uint8Array.from(nonceCiphertext[0]),
+    Uint8Array.from(reservedCiphertext[0]),
+  ];
+}
+
 // Config
 const useLocal = process.argv.includes("--local");
 const configPath = useLocal
@@ -64,8 +122,8 @@ const configPath = useLocal
   : __dirname + "/../miner-config-devnet.json";
 const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
-// Program IDs (pow-protocol is derived from IDL address to avoid stale config)
-const POW_PRIVACY_ID = new PublicKey("9iC7Ez6VcqG9TvPEZ31szdnhUrsCYBvmj2u9YeDBWErT");
+// Program IDs (from pow-programs Anchor.toml devnet)
+const POW_PRIVACY_ID = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
 const TRANSFER_HOOK_PROGRAM_ID = new PublicKey("4Q1SrMmhDhtkgsQiCutmkJxYJ1TWYTm9oh5R3h9tENcZ");
 const POW_PROTOCOL_ID = new PublicKey("Ai9XrxSUmDLNCXkoeoqnYuzPgN9F2PeF9WtLq9GyqER");
 const MINT = new PublicKey(config.mint);
@@ -89,7 +147,6 @@ const POW_CONFIG_SEED = Buffer.from("pow_config");
 const POW_FEE_VAULT_SEED = Buffer.from("fee_vault");
 const POW_MINER_STATS_SEED = Buffer.from("miner_stats");
 const POW_MINT_AUTHORITY_SEED = Buffer.from("pow_mint_auth");
-const DEVICE_ATTEST_SEED = Buffer.from("device_attest");
 
 // Pool IDs
 const POOL_NORMAL: number = 0;
@@ -1798,12 +1855,6 @@ async function main() {
     POW_PROTOCOL_ID
   );
 
-  // Device attestation PDA for privacy_authority
-  const [powAttestation] = PublicKey.findProgramAddressSync(
-    [DEVICE_ATTEST_SEED, privacyAuthority.toBuffer()],
-    POW_PROTOCOL_ID
-  );
-
   const [signPdaAccount] = PublicKey.findProgramAddressSync(
     [SIGN_PDA_SEED],
     POW_PRIVACY_ID
@@ -1843,6 +1894,26 @@ async function main() {
     console.log("Privacy protocol not initialized!");
     console.log("Run: npx ts-node scripts/init-privacy.ts");
     process.exit(1);
+  }
+
+  // =========================================================================
+  // Load Address Lookup Table (ALT) for versioned transactions
+  // =========================================================================
+  let addressLookupTableAccount: AddressLookupTableAccount | null = null;
+  try {
+    const altConfigPath = __dirname + "/../alt-config.json";
+    const altConfig = JSON.parse(fs.readFileSync(altConfigPath, "utf-8"));
+    const altAddress = new PublicKey(altConfig.altAddress);
+    const altAccountInfo = await connection.getAddressLookupTable(altAddress);
+    if (altAccountInfo.value) {
+      addressLookupTableAccount = altAccountInfo.value;
+      console.log(`ALT loaded: ${altAddress.toString()} (${addressLookupTableAccount.state.addresses.length} addresses)`);
+    } else {
+      console.log("Warning: ALT account not found, transactions may be too large");
+    }
+  } catch (e: any) {
+    console.log("Warning: Could not load ALT config:", e.message);
+    console.log("Run: npx ts-node scripts/create-alt.ts");
   }
 
   // Initialize claim context for manual claiming from menu
@@ -2086,7 +2157,6 @@ async function main() {
           mint: MINT,
           privacyMinerStats: privacyMinerStats,
           powFeeCollector: powFeeVault,
-          powAttestation: powAttestation,
           powProgram: POW_PROTOCOL_ID,
           tokenProgram: tokenProgramId,
           systemProgram: SystemProgram.programId,
@@ -2108,22 +2178,46 @@ async function main() {
 
       const methodWithBudget = method.preInstructions([computeBudgetIx]);
 
+      // Build instructions from Anchor method
+      const instructions = await methodWithBudget.instruction();
+      const allInstructions = [computeBudgetIx, instructions];
+
+      // Use versioned transaction with ALT to reduce size
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+      const lookupTables = addressLookupTableAccount ? [addressLookupTableAccount] : [];
+
+      const messageV0 = new TransactionMessage({
+        payerKey: wallet.publicKey,
+        recentBlockhash: blockhash,
+        instructions: allInstructions,
+      }).compileToV0Message(lookupTables);
+
+      const versionedTx = new VersionedTransaction(messageV0);
+      versionedTx.sign([walletKeypair]);
+
+      // Simulate first
       try {
-        const sim: any = await methodWithBudget.simulate();
-        if (sim?.logs) {
-          console.log("Simulation logs:");
-          sim.logs.forEach((log: string, i: number) => console.log(`  ${i}: ${log}`));
+        const sim = await connection.simulateTransaction(versionedTx, { commitment: "confirmed" });
+        if (sim.value.err) {
+          console.error("Simulation failed:", JSON.stringify(sim.value.err));
+          if (sim.value.logs) {
+            console.error("Simulation logs:");
+            sim.value.logs.slice(-10).forEach((log: string, i: number) => console.error(`  ${i}: ${log}`));
+          }
+          throw new Error(`Simulation error: ${JSON.stringify(sim.value.err)}`);
         }
       } catch (simErr: any) {
+        if (simErr?.message?.includes("Simulation error:")) throw simErr;
         console.error("Simulation failed:", simErr?.message || simErr);
-        if (simErr?.logs) {
-          console.error("Simulation logs:");
-          simErr.logs.forEach((log: string, i: number) => console.error(`  ${i}: ${log}`));
-        }
         throw simErr;
       }
 
-      const tx = await methodWithBudget.rpc({ skipPreflight: false });
+      const txSig = await connection.sendRawTransaction(versionedTx.serialize(), {
+        skipPreflight: true,
+        maxRetries: 3,
+      });
+      await connection.confirmTransaction({ signature: txSig, blockhash, lastValidBlockHeight }, "confirmed");
+      const tx = txSig;
 
       sessionBlockCount++;
 
