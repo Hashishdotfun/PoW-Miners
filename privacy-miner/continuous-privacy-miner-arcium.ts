@@ -1280,14 +1280,14 @@ async function mineWithGpu(
       '--miner-pubkey', minerPubkey
     ];
 
-    currentMiningProcess = spawn('./target/release/miner', args, {
-      cwd: '/home/antoninweb3/PoWSolana',
-      env: {
-        ...process.env,
-        RUST_LOG: 'info',
-        LD_LIBRARY_PATH: '/usr/lib/wsl/lib'
-      }
-    });
+    const minerBinary = __dirname + '/../gpu-miner/target/release/miner';
+    const isWSL = fs.existsSync('/usr/lib/wsl/lib');
+    const env: Record<string, string> = { ...process.env as Record<string, string>, RUST_LOG: 'info' };
+    if (isWSL) {
+      env.LD_LIBRARY_PATH = '/usr/lib/wsl/lib';
+    }
+
+    currentMiningProcess = spawn(minerBinary, args, { env });
 
     let output = '';
 
