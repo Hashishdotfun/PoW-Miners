@@ -48,15 +48,19 @@ const POOL_SEEKER: number = 1;
 async function mineWithGpu(challenge: string, minerPubkey: string, blockNumber: number, difficulty: number): Promise<{ nonce: number, hashrate: number, time_ms: number } | null> {
   try {
     // Pass miner pubkey to Rust miner for anti-pool-theft hash computation
-    const cmd = `cd /home/antoninweb3/PoWSolana && LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH ./target/release/miner --benchmark --backend cuda --difficulty ${difficulty} --challenge ${challenge} --block-number ${blockNumber} --miner-pubkey ${minerPubkey}`;
+    const minerBinary = __dirname + "/../gpu-miner/target/release/miner";
+    const isWSL = fs.existsSync("/usr/lib/wsl/lib");
+    const ldPrefix = isWSL ? `LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH ` : "";
+    const cmd = `${ldPrefix}${minerBinary} --benchmark --backend cuda --difficulty ${difficulty} --challenge ${challenge} --block-number ${blockNumber} --miner-pubkey ${minerPubkey}`;
+
+    const env: Record<string, string> = { ...process.env as Record<string, string>, RUST_LOG: 'info' };
+    if (isWSL) {
+      env.LD_LIBRARY_PATH = '/usr/lib/wsl/lib';
+    }
 
     const { stdout, stderr } = await execAsync(cmd, {
       timeout: 1800000, // 30 min max pour les hautes difficultés
-      env: {
-        ...process.env,
-        RUST_LOG: 'info',
-        LD_LIBRARY_PATH: '/usr/lib/wsl/lib'
-      }
+      env,
     });
 
     const output = stdout + stderr;

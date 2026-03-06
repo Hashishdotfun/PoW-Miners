@@ -1,6 +1,9 @@
 # Build artifacts
 dist/
 build/
+target/
+Cargo.lock
+*.ptx
 
 # Node
 node_modules/
