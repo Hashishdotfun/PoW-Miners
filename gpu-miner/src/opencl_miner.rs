@@ -1,6 +1,6 @@
 //! OpenCL Mining Backend (TODO)
 
-use crate::miner::MinerBackend;
+use crate::miner::{MinerBackend, ProgressReporter};
 use anyhow::{Result, anyhow};
 
 pub struct OpenClMiner;
@@ -12,7 +12,15 @@ impl OpenClMiner {
 }
 
 impl MinerBackend for OpenClMiner {
-    fn mine(&self, _challenge: &[u8; 32], _miner_pubkey: &[u8; 32], _block_number: u64, _target: u128, _max_nonce: u128) -> Option<u128> {
+    fn mine_with_progress(
+        &self,
+        _challenge: &[u8; 32],
+        _miner_pubkey: &[u8; 32],
+        _block_number: u64,
+        _target: u128,
+        _max_nonce: u128,
+        _progress: &mut dyn ProgressReporter,
+    ) -> Option<u128> {
         None
     }
 

@@ -33,6 +33,14 @@ struct Cli {
     #[arg(short, long, default_value = "0")]
     device: usize,
 
+    /// CUDA threads par block
+    #[arg(long)]
+    cuda_threads_per_block: Option<usize>,
+
+    /// CUDA nombre de blocks par launch
+    #[arg(long)]
+    cuda_num_blocks: Option<usize>,
+
     /// Mode benchmark (ne se connecte pas au réseau)
     #[arg(long)]
     benchmark: bool,
@@ -70,6 +78,22 @@ struct Cli {
     miner_pubkey: Option<String>,
 }
 
+#[cfg(feature = "cuda")]
+fn build_cuda_miner(cli: &Cli) -> anyhow::Result<cuda_miner::CudaMiner> {
+    match (cli.cuda_threads_per_block, cli.cuda_num_blocks) {
+        (Some(threads_per_block), Some(num_blocks)) => {
+            cuda_miner::CudaMiner::with_config(cli.device, threads_per_block, num_blocks)
+        }
+        (Some(threads_per_block), None) => {
+            cuda_miner::CudaMiner::with_config(cli.device, threads_per_block, 1024)
+        }
+        (None, Some(num_blocks)) => {
+            cuda_miner::CudaMiner::with_config(cli.device, 256, num_blocks)
+        }
+        (None, None) => cuda_miner::CudaMiner::new(cli.device),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -91,10 +115,12 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "cuda")]
         "cuda" => {
             info!("   Using CUDA backend");
-            match cuda_miner::CudaMiner::new(cli.device) {
+            match build_cuda_miner(&cli) {
                 Ok(m) => {
                     info!("   ✓ CUDA initialized");
                     info!("   Device: {}", cli.device);
+                    info!("   Threads/block: {}", m.threads_per_block());
+                    info!("   Num blocks: {}", m.num_blocks());
                     Box::new(m)
                 }
                 Err(e) => {
@@ -127,8 +153,10 @@ async fn main() -> anyhow::Result<()> {
             // Try CUDA first
             #[cfg(feature = "cuda")]
             {
-                if let Ok(m) = cuda_miner::CudaMiner::new(cli.device) {
+                if let Ok(m) = build_cuda_miner(&cli) {
                     info!("   ✓ Using CUDA");
+                    info!("   Threads/block: {}", m.threads_per_block());
+                    info!("   Num blocks: {}", m.num_blocks());
                     Box::new(m) as Box<dyn MinerBackend>
                 } else {
                     // Try OpenCL or fall back to CPU
@@ -226,14 +254,54 @@ async fn run_benchmark(
 
     info!("Difficulty: {}", difficulty);
     info!("Block number: {}", block_number);
+    info!("Backend: {}", miner.name());
     info!("Challenge: {}", hex::encode(&challenge[..8]));
     info!("Miner: {}", hex::encode(&miner_pubkey[..8]));
     info!("Target: {:032x}", target);
     info!("\n⛏️  Mining...\n");
 
     let start = Instant::now();
+    let mut last_report_at = Instant::now();
+    let mut last_reported_hashes = 0u128;
+    let mut progress = |hashes_checked: u128| {
+        let now = Instant::now();
+        let delta = now.duration_since(last_report_at);
+        if delta.as_millis() < 500 {
+            return;
+        }
 
-    match miner.mine(&challenge, &miner_pubkey, block_number, target, u128::MAX) {
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        if elapsed_secs <= 0.0 {
+            return;
+        }
+
+        let delta_hashes = hashes_checked.saturating_sub(last_reported_hashes) as f64;
+        let live_hashrate = if delta.as_secs_f64() > 0.0 {
+            delta_hashes / delta.as_secs_f64()
+        } else {
+            0.0
+        };
+        let avg_hashrate = hashes_checked as f64 / elapsed_secs;
+
+        info!(
+            "Progress: {} hashes | Live: {:.2} MH/s | Avg: {:.2} MH/s",
+            hashes_checked,
+            live_hashrate / 1_000_000.0,
+            avg_hashrate / 1_000_000.0
+        );
+
+        last_report_at = now;
+        last_reported_hashes = hashes_checked;
+    };
+
+    match miner.mine_with_progress(
+        &challenge,
+        &miner_pubkey,
+        block_number,
+        target,
+        u128::MAX,
+        &mut progress,
+    ) {
         Some(nonce) => {
             let elapsed = start.elapsed();
             let hashrate = (nonce as f64) / elapsed.as_secs_f64();

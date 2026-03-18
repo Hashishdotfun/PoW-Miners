@@ -152,6 +152,25 @@ npx ts-node standard-miner/continuous-gpu-miner.ts --local   # localnet
 
 The orchestrator fetches the current challenge + difficulty from on-chain, spawns the Rust binary with `--backend cuda`, parses the nonce from stdout, and submits the proof.
 
+The terminal dashboard now shows:
+
+- live hashrate reported by the Rust benchmark loop
+- session average hashrate
+- hashes checked during the current round
+- current block/challenge state and last submit tx
+
+Optional GPU tuning fields in `miner-config-devnet.json`:
+
+```json
+{
+  "gpu_backend": "cuda",
+  "gpu_device": 0,
+  "cuda_threads_per_block": 256,
+  "cuda_num_blocks": 1024,
+  "challenge_poll_interval_ms": 1500
+}
+```
+
 > **Note:** The Rust binary path is set in `continuous-gpu-miner.ts`. Update if needed.
 
 ---

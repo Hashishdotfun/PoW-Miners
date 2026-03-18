@@ -5,11 +5,51 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub trait ProgressReporter {
+    fn report(&mut self, hashes_checked: u128);
+}
+
+impl<F> ProgressReporter for F
+where
+    F: FnMut(u128),
+{
+    fn report(&mut self, hashes_checked: u128) {
+        self(hashes_checked);
+    }
+}
+
 /// Trait pour les différents backends de mining
 pub trait MinerBackend: Send + Sync {
     /// Mine un bloc jusqu'à trouver un nonce valide ou atteindre max_nonce
     /// miner_pubkey est inclus dans le hash pour empêcher le vol de travail
-    fn mine(&self, challenge: &[u8; 32], miner_pubkey: &[u8; 32], block_number: u64, target: u128, max_nonce: u128) -> Option<u128>;
+    fn mine_with_progress(
+        &self,
+        challenge: &[u8; 32],
+        miner_pubkey: &[u8; 32],
+        block_number: u64,
+        target: u128,
+        max_nonce: u128,
+        progress: &mut dyn ProgressReporter,
+    ) -> Option<u128>;
+
+    fn mine(
+        &self,
+        challenge: &[u8; 32],
+        miner_pubkey: &[u8; 32],
+        block_number: u64,
+        target: u128,
+        max_nonce: u128,
+    ) -> Option<u128> {
+        let mut noop = |_hashes_checked: u128| {};
+        self.mine_with_progress(
+            challenge,
+            miner_pubkey,
+            block_number,
+            target,
+            max_nonce,
+            &mut noop,
+        )
+    }
 
     /// Nom du backend
     fn name(&self) -> &str;
@@ -30,7 +70,15 @@ impl CpuMiner {
 }
 
 impl MinerBackend for CpuMiner {
-    fn mine(&self, challenge: &[u8; 32], miner_pubkey: &[u8; 32], block_number: u64, target: u128, max_nonce: u128) -> Option<u128> {
+    fn mine_with_progress(
+        &self,
+        challenge: &[u8; 32],
+        miner_pubkey: &[u8; 32],
+        block_number: u64,
+        target: u128,
+        max_nonce: u128,
+        _progress: &mut dyn ProgressReporter,
+    ) -> Option<u128> {
         let found = Arc::new(AtomicBool::new(false));
         let result = Arc::new(Mutex::new(0u128));
         let miner_pubkey = *miner_pubkey; // Copy for threads
@@ -94,14 +142,26 @@ impl MinerBackend for CpuMiner {
 pub struct SimpleCpuMiner;
 
 impl MinerBackend for SimpleCpuMiner {
-    fn mine(&self, challenge: &[u8; 32], miner_pubkey: &[u8; 32], block_number: u64, target: u128, max_nonce: u128) -> Option<u128> {
+    fn mine_with_progress(
+        &self,
+        challenge: &[u8; 32],
+        miner_pubkey: &[u8; 32],
+        block_number: u64,
+        target: u128,
+        max_nonce: u128,
+        progress: &mut dyn ProgressReporter,
+    ) -> Option<u128> {
         let mut nonce = 0u128;
         while nonce < max_nonce {
             if pow::verify_nonce(challenge, miner_pubkey, nonce, block_number, target) {
                 return Some(nonce);
             }
+            if nonce > 0 && nonce % 1_000_000 == 0 {
+                progress.report(nonce);
+            }
             nonce += 1;
         }
+        progress.report(max_nonce);
         None
     }
 

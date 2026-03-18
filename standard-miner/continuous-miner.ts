@@ -70,8 +70,20 @@ function computeHash(challenge: Buffer, minerPubkey: Buffer, nonce: bigint, bloc
   return hasher.digest();
 }
 
-function mineBlock(challenge: Buffer, minerPubkey: Buffer, blockNumber: bigint, target: bigint, maxNonce: number): { nonce: bigint, hashrate: number } | null {
+type MineResult = { nonce: bigint, hashrate: number } | 'stolen' | null;
+
+const POLL_INTERVAL_MS = 3000; // Check for stolen block every 3s
+
+async function mineBlock(
+  challenge: Buffer,
+  minerPubkey: Buffer,
+  blockNumber: bigint,
+  target: bigint,
+  maxNonce: number,
+  checkStolen: () => Promise<boolean>,
+): Promise<MineResult> {
   const startTime = Date.now();
+  let lastCheckTime = startTime;
 
   for (let nonce = 0; nonce < maxNonce; nonce++) {
     const hash = computeHash(challenge, minerPubkey, BigInt(nonce), blockNumber);
@@ -81,6 +93,15 @@ function mineBlock(challenge: Buffer, minerPubkey: Buffer, blockNumber: bigint, 
       const elapsed = (Date.now() - startTime) / 1000;
       const hashrate = nonce / elapsed / 1_000_000;
       return { nonce: BigInt(nonce), hashrate };
+    }
+
+    // Check if block was stolen every ~3s
+    const now = Date.now();
+    if (now - lastCheckTime >= POLL_INTERVAL_MS) {
+      lastCheckTime = now;
+      if (await checkStolen()) {
+        return 'stolen';
+      }
     }
   }
 
@@ -218,7 +239,27 @@ async function main() {
       // Miner pubkey as Buffer (32 bytes)
       const minerPubkey = wallet.publicKey.toBuffer();
 
-      const result = mineBlock(challenge, minerPubkey, blocksMined, target, 100_000_000); // 100M max
+      const checkStolen = async (): Promise<boolean> => {
+        try {
+          const freshInfo = await connection.getAccountInfo(powConfig);
+          if (!freshInfo) return false;
+          const freshBlocks = freshInfo.data.readBigUInt64LE(96);
+          if (freshBlocks !== blocksMined) {
+            console.log(`\n🚫 Block stolen! Block moved from #${blocksMined} to #${freshBlocks}`);
+            console.log(`   Someone else mined it first. Restarting...\n`);
+            return true;
+          }
+        } catch {
+          // RPC error, ignore and continue mining
+        }
+        return false;
+      };
+
+      const result = await mineBlock(challenge, minerPubkey, blocksMined, target, 100_000_000, checkStolen); // 100M max
+
+      if (result === 'stolen') {
+        continue;
+      }
 
       if (result === null) {
         console.log("❌ Mining failed - difficulty too high, retrying in 5s...\n");

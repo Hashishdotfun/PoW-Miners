@@ -4,7 +4,7 @@
 use cudarc::driver::*;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
-use crate::miner::MinerBackend;
+use crate::miner::{MinerBackend, ProgressReporter};
 use anyhow::Result;
 #[cfg(not(feature = "cuda"))]
 use anyhow::anyhow;
@@ -43,11 +43,27 @@ impl CudaMiner {
         miner.num_blocks = num_blocks;
         Ok(miner)
     }
+
+    pub fn threads_per_block(&self) -> usize {
+        self.threads_per_block
+    }
+
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
 }
 
 #[cfg(feature = "cuda")]
 impl MinerBackend for CudaMiner {
-    fn mine(&self, challenge: &[u8; 32], miner_pubkey: &[u8; 32], block_number: u64, target: u128, max_nonce: u128) -> Option<u128> {
+    fn mine_with_progress(
+        &self,
+        challenge: &[u8; 32],
+        miner_pubkey: &[u8; 32],
+        block_number: u64,
+        target: u128,
+        max_nonce: u128,
+        progress: &mut dyn ProgressReporter,
+    ) -> Option<u128> {
         // Pour l'instant, limiter à u64::MAX pour la partie GPU
         // TODO: Implémenter u128 dans CUDA kernel
         let max_nonce_u64 = if max_nonce > u64::MAX as u128 {
@@ -72,6 +88,9 @@ impl MinerBackend for CudaMiner {
 
         // Mine in batches
         let mut start_nonce = 0u64;
+        let mut checked_hashes = 0u128;
+        let report_interval = std::cmp::max(nonce_count as u128 * 512, 250_000_000u128);
+        let mut last_reported_hashes = 0u128;
 
         while start_nonce < max_nonce_u64 {
             let current_nonce_count = (max_nonce_u64 - start_nonce).min(nonce_count);
@@ -103,12 +122,21 @@ impl MinerBackend for CudaMiner {
             let found = self.device.dtoh_sync_copy(&d_found).ok()?;
             if found[0] == 1 {
                 let nonce = self.device.dtoh_sync_copy(&d_result).ok()?;
+                checked_hashes = std::cmp::max(checked_hashes, nonce[0] as u128);
+                progress.report(checked_hashes);
                 return Some(nonce[0] as u128);
             }
 
             start_nonce += current_nonce_count;
+            checked_hashes += current_nonce_count as u128;
+
+            if checked_hashes.saturating_sub(last_reported_hashes) >= report_interval {
+                progress.report(checked_hashes);
+                last_reported_hashes = checked_hashes;
+            }
         }
 
+        progress.report(checked_hashes);
         None
     }
 
@@ -130,7 +158,15 @@ impl CudaMiner {
 
 #[cfg(not(feature = "cuda"))]
 impl MinerBackend for CudaMiner {
-    fn mine(&self, _challenge: &[u8; 32], _miner_pubkey: &[u8; 32], _block_number: u64, _target: u128, _max_nonce: u128) -> Option<u128> {
+    fn mine_with_progress(
+        &self,
+        _challenge: &[u8; 32],
+        _miner_pubkey: &[u8; 32],
+        _block_number: u64,
+        _target: u128,
+        _max_nonce: u128,
+        _progress: &mut dyn ProgressReporter,
+    ) -> Option<u128> {
         None
     }
 
