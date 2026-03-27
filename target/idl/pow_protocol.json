@@ -1,5 +1,5 @@
 {
-  "address": "9FBbm3FJSG2tqL1zcXgT4pc9UyDV2WiGhCpgWGYzsQnz",
+  "address": "PoWQ79wY7LXrKaU8vZBoFb4JgSytENSdpAQAPJaZiSh",
   "metadata": {
     "name": "pow_protocol",
     "version": "0.1.0",
@@ -8,57 +8,6 @@
     "repository": "https://github.com/yourname/pow-solana"
   },
   "instructions": [
-    {
-      "name": "add_pending_reward",
-      "docs": [
-        "Ajoute des tokens au pool de pending reward",
-        "",
-        "Appelé par le programme transfer hook quand la taxe est collectée.",
-        "50% de la taxe va ici (les autres 50% sont brûlés par le hook).",
-        "",
-        "# Arguments",
-        "- `amount`: Montant de tokens à ajouter"
-      ],
-      "discriminator": [
-        192,
-        70,
-        115,
-        211,
-        47,
-        140,
-        91,
-        185
-      ],
-      "accounts": [
-        {
-          "name": "caller",
-          "docs": [
-            "Must be the transfer-hook fee_vault PDA (verified in handler)"
-          ],
-          "signer": true
-        },
-        {
-          "name": "pow_config_normal",
-          "docs": [
-            "Configuration du pool normal (pool 0)"
-          ],
-          "writable": true
-        },
-        {
-          "name": "pow_config_seeker",
-          "docs": [
-            "Configuration du pool seeker (pool 1)"
-          ],
-          "writable": true
-        }
-      ],
-      "args": [
-        {
-          "name": "amount",
-          "type": "u64"
-        }
-      ]
-    },
     {
       "name": "claim_team_fees",
       "docs": [
@@ -856,161 +805,12 @@
       "args": []
     },
     {
-      "name": "mint_cranker_reward",
-      "docs": [
-        "Mint une reward HASHISH au cranker qui appelle collect_and_distribute_fees",
-        "",
-        "Callable uniquement par le fee_vault PDA du transfer hook.",
-        "Le montant est soumis au supply cap.",
-        "",
-        "# Arguments",
-        "- `amount`: Montant à minter pour le cranker"
-      ],
-      "discriminator": [
-        23,
-        137,
-        158,
-        121,
-        240,
-        237,
-        109,
-        74
-      ],
-      "accounts": [
-        {
-          "name": "caller",
-          "docs": [
-            "Must be the transfer-hook fee_vault PDA (verified in handler)"
-          ],
-          "signer": true
-        },
-        {
-          "name": "pow_config_normal",
-          "docs": [
-            "Configuration du pool normal (pool 0)"
-          ],
-          "writable": true
-        },
-        {
-          "name": "pow_config_seeker",
-          "docs": [
-            "Configuration du pool seeker (pool 1)"
-          ],
-          "writable": true
-        },
-        {
-          "name": "mint_authority",
-          "docs": [
-            "Shared mint authority PDA"
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  112,
-                  111,
-                  119,
-                  95,
-                  109,
-                  105,
-                  110,
-                  116,
-                  95,
-                  97,
-                  117,
-                  116,
-                  104
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "mint",
-          "docs": [
-            "Token mint"
-          ],
-          "writable": true
-        },
-        {
-          "name": "cranker_token_account",
-          "docs": [
-            "Cranker's token account (receives the reward)"
-          ],
-          "writable": true
-        },
-        {
-          "name": "token_program"
-        }
-      ],
-      "args": [
-        {
-          "name": "amount",
-          "type": "u64"
-        }
-      ]
-    },
-    {
-      "name": "record_transfer_burn",
-      "docs": [
-        "Enregistre les tokens brûlés via la taxe transfert",
-        "",
-        "Diminue total_supply_mined pour libérer du cap supply.",
-        "",
-        "# Arguments",
-        "- `amount`: Montant brûlé"
-      ],
-      "discriminator": [
-        66,
-        35,
-        32,
-        62,
-        17,
-        231,
-        255,
-        181
-      ],
-      "accounts": [
-        {
-          "name": "caller",
-          "docs": [
-            "Must be the transfer-hook fee_vault PDA (verified in handler)"
-          ],
-          "signer": true
-        },
-        {
-          "name": "pow_config_normal",
-          "docs": [
-            "Configuration du pool normal (pool 0)"
-          ],
-          "writable": true
-        },
-        {
-          "name": "pow_config_seeker",
-          "docs": [
-            "Configuration du pool seeker (pool 1)"
-          ],
-          "writable": true
-        }
-      ],
-      "args": [
-        {
-          "name": "amount",
-          "type": "u64"
-        }
-      ]
-    },
-    {
       "name": "record_treasury_burn",
       "docs": [
         "Enregistre les tokens brûlés via le treasury buyback",
         "",
         "Diminue total_supply_mined pour libérer du cap supply.",
-        "Callable par le programme pow-treasury uniquement.",
-        "",
-        "# Arguments",
-        "- `amount`: Montant brûlé"
+        "Callable par le programme pow-treasury uniquement."
       ],
       "discriminator": [
         217,
@@ -2153,6 +1953,17 @@
             ],
             "type": {
               "option": "pubkey"
+            }
+          },
+          {
+            "name": "premint_supply",
+            "docs": [
+              "Register preminted supply against the max supply cap.",
+              "Can only be set once (when total_supply_mined == 0) and only on pool 0.",
+              "The amount is added to total_supply_mined so miners can only mine MAX_SUPPLY - premint."
+            ],
+            "type": {
+              "option": "u64"
             }
           }
         ]
