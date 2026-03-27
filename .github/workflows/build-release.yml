@@ -122,10 +122,15 @@ jobs:
   build-gpu-binary-windows:
     name: Build GPU Binary (Windows + CUDA)
     runs-on: windows-latest
+    env:
+      OPENSSL_DIR: C:\Program Files\OpenSSL
     steps:
       - uses: actions/checkout@v4
 
       - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install OpenSSL
+        run: choco install openssl -y
 
       - uses: Jimver/cuda-toolkit@v0.2.18
         with:
