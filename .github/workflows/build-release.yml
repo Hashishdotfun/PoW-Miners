@@ -119,20 +119,39 @@ jobs:
           name: gpu-orchestrator-${{ matrix.suffix }}
           path: hashish-gpu-orchestrator-${{ matrix.suffix }}${{ matrix.ext }}
 
-  build-gpu-binary:
-    name: Build GPU Binary (${{ matrix.label }})
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            label: Windows
-            ext: .exe
-            suffix: win-x64
-          - os: ubuntu-latest
-            label: Linux
-            ext: ""
-            suffix: linux-x64
-    runs-on: ${{ matrix.os }}
+  build-gpu-binary-windows:
+    name: Build GPU Binary (Windows + CUDA)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: Jimver/cuda-toolkit@v0.2.18
+        with:
+          cuda: '12.5.0'
+          method: 'network'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile CUDA kernel
+        run: nvcc gpu-miner/kernels/sha256_mining.cu --ptx -o gpu-miner/kernels/sha256_mining.ptx -O3 --use_fast_math
+
+      - name: Build GPU miner
+        run: cargo build --release --features cuda
+        working-directory: gpu-miner
+
+      - name: Rename binary
+        run: copy gpu-miner\target\release\miner.exe hashish-gpu-miner-win-x64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-miner-win-x64
+          path: hashish-gpu-miner-win-x64.exe
+
+  build-gpu-binary-linux:
+    name: Build GPU Binary (Linux + CUDA)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -147,24 +166,20 @@ jobs:
         run: nvcc gpu-miner/kernels/sha256_mining.cu --ptx -o gpu-miner/kernels/sha256_mining.ptx -O3 --use_fast_math
 
       - name: Build GPU miner
-        run: cargo build --release -p pow-miner --features cuda
+        run: cargo build --release --features cuda
+        working-directory: gpu-miner
 
-      - name: Upload artifact (Windows)
-        if: matrix.os == 'windows-latest'
-        run: copy target\release\miner.exe hashish-gpu-miner-${{ matrix.suffix }}.exe
-
-      - name: Upload artifact (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: cp target/release/miner hashish-gpu-miner-${{ matrix.suffix }}
+      - name: Rename binary
+        run: cp gpu-miner/target/release/miner hashish-gpu-miner-linux-x64
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gpu-miner-${{ matrix.suffix }}
-          path: hashish-gpu-miner-${{ matrix.suffix }}${{ matrix.ext }}
+          name: gpu-miner-linux-x64
+          path: hashish-gpu-miner-linux-x64
 
   create-release:
     name: Create Release
-    needs: [build-cpu-miner, build-gpu-binary, build-gpu-orchestrator]
+    needs: [build-cpu-miner, build-gpu-binary-windows, build-gpu-binary-linux, build-gpu-orchestrator]
     runs-on: ubuntu-latest
     permissions:
       contents: write
