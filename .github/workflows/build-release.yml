@@ -7,8 +7,23 @@ on:
 
 jobs:
   build-cpu-miner:
-    name: Build CPU Miner (Windows)
+    name: Build CPU Miner (${{ matrix.label }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: node18-win-x64
+            label: Windows
+            ext: .exe
+            suffix: win-x64
+          - target: node18-linux-x64
+            label: Linux
+            ext: ""
+            suffix: linux-x64
+          - target: node18-macos-x64
+            label: macOS
+            ext: ""
+            suffix: macos-x64
     steps:
       - uses: actions/checkout@v4
 
@@ -40,46 +55,32 @@ jobs:
           console.log('IDL inlined');
           "
 
-      - name: Package Windows exe
-        run: pkg dist/continuous-miner.js --targets node18-win-x64 --output hashish-cpu-miner.exe
+      - name: Package binary
+        run: pkg dist/continuous-miner.js --targets ${{ matrix.target }} --output hashish-cpu-miner-${{ matrix.suffix }}${{ matrix.ext }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cpu-miner
-          path: hashish-cpu-miner.exe
-
-  build-gpu-binary:
-    name: Build GPU Binary (Windows + CUDA)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: Jimver/cuda-toolkit@v0.2.18
-        with:
-          cuda: '12.5.0'
-          method: 'network'
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Compile CUDA kernel
-        run: |
-          nvcc gpu-miner/kernels/sha256_mining.cu --ptx -o gpu-miner/kernels/sha256_mining.ptx -O3 --use_fast_math
-
-      - name: Build GPU miner
-        run: cargo build --release -p pow-miner --features cuda
-        working-directory: .
-
-      - name: Rename binary
-        run: copy target\release\miner.exe hashish-gpu-miner.exe
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: gpu-miner
-          path: hashish-gpu-miner.exe
+          name: cpu-miner-${{ matrix.suffix }}
+          path: hashish-cpu-miner-${{ matrix.suffix }}${{ matrix.ext }}
 
   build-gpu-orchestrator:
-    name: Build GPU Orchestrator (Windows)
+    name: Build GPU Orchestrator (${{ matrix.label }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: node18-win-x64
+            label: Windows
+            ext: .exe
+            suffix: win-x64
+          - target: node18-linux-x64
+            label: Linux
+            ext: ""
+            suffix: linux-x64
+          - target: node18-macos-x64
+            label: macOS
+            ext: ""
+            suffix: macos-x64
     steps:
       - uses: actions/checkout@v4
 
@@ -110,13 +111,56 @@ jobs:
           console.log('IDL inlined');
           "
 
-      - name: Package Windows exe
-        run: pkg dist/continuous-gpu-miner.js --targets node18-win-x64 --output hashish-gpu-orchestrator.exe
+      - name: Package binary
+        run: pkg dist/continuous-gpu-miner.js --targets ${{ matrix.target }} --output hashish-gpu-orchestrator-${{ matrix.suffix }}${{ matrix.ext }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gpu-orchestrator
-          path: hashish-gpu-orchestrator.exe
+          name: gpu-orchestrator-${{ matrix.suffix }}
+          path: hashish-gpu-orchestrator-${{ matrix.suffix }}${{ matrix.ext }}
+
+  build-gpu-binary:
+    name: Build GPU Binary (${{ matrix.label }})
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows
+            ext: .exe
+            suffix: win-x64
+          - os: ubuntu-latest
+            label: Linux
+            ext: ""
+            suffix: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Jimver/cuda-toolkit@v0.2.18
+        with:
+          cuda: '12.5.0'
+          method: 'network'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile CUDA kernel
+        run: nvcc gpu-miner/kernels/sha256_mining.cu --ptx -o gpu-miner/kernels/sha256_mining.ptx -O3 --use_fast_math
+
+      - name: Build GPU miner
+        run: cargo build --release -p pow-miner --features cuda
+
+      - name: Upload artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        run: copy target\release\miner.exe hashish-gpu-miner-${{ matrix.suffix }}.exe
+
+      - name: Upload artifact (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cp target/release/miner hashish-gpu-miner-${{ matrix.suffix }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-miner-${{ matrix.suffix }}
+          path: hashish-gpu-miner-${{ matrix.suffix }}${{ matrix.ext }}
 
   create-release:
     name: Create Release
@@ -131,29 +175,49 @@ jobs:
         with:
           path: artifacts
 
+      - name: List artifacts
+        run: find artifacts -type f
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/cpu-miner/hashish-cpu-miner.exe
-            artifacts/gpu-miner/hashish-gpu-miner.exe
-            artifacts/gpu-orchestrator/hashish-gpu-orchestrator.exe
+            artifacts/cpu-miner-win-x64/hashish-cpu-miner-win-x64.exe
+            artifacts/cpu-miner-linux-x64/hashish-cpu-miner-linux-x64
+            artifacts/cpu-miner-macos-x64/hashish-cpu-miner-macos-x64
+            artifacts/gpu-miner-win-x64/hashish-gpu-miner-win-x64.exe
+            artifacts/gpu-miner-linux-x64/hashish-gpu-miner-linux-x64
+            artifacts/gpu-orchestrator-win-x64/hashish-gpu-orchestrator-win-x64.exe
+            artifacts/gpu-orchestrator-linux-x64/hashish-gpu-orchestrator-linux-x64
+            artifacts/gpu-orchestrator-macos-x64/hashish-gpu-orchestrator-macos-x64
             miner-config.example.json
           body: |
             ## Hashish Miner
 
             ### CPU Miner (simple)
-            1. Download `hashish-cpu-miner.exe` + `miner-config.example.json`
+            | Platform | File |
+            |----------|------|
+            | Windows | `hashish-cpu-miner-win-x64.exe` |
+            | Linux | `hashish-cpu-miner-linux-x64` |
+            | macOS | `hashish-cpu-miner-macos-x64` |
+
+            1. Download the CPU miner for your platform + `miner-config.example.json`
             2. Rename config to `miner-config.json`, set your `wallet_path`
-            3. Run `hashish-cpu-miner.exe`
+            3. Run the binary
 
             ### GPU Miner (NVIDIA CUDA)
-            1. Download `hashish-gpu-miner.exe` + `hashish-gpu-orchestrator.exe` + `miner-config.example.json`
-            2. Put all 3 files in the same folder
+            | Platform | Files needed |
+            |----------|-------------|
+            | Windows | `hashish-gpu-orchestrator-win-x64.exe` + `hashish-gpu-miner-win-x64.exe` |
+            | Linux | `hashish-gpu-orchestrator-linux-x64` + `hashish-gpu-miner-linux-x64` |
+
+            1. Download both GPU files for your platform + `miner-config.example.json`
+            2. Put all files in the same folder
             3. Rename config to `miner-config.json`, set your `wallet_path`
-            4. Run `hashish-gpu-orchestrator.exe`
+            4. Run the orchestrator binary
 
             > GPU miner requires NVIDIA GPU with CUDA drivers installed.
+            > macOS GPU miner is not available (no CUDA support on macOS).
 
             ### Wallet format
             - **Solana CLI**: JSON array `[12,34,56,...]`
