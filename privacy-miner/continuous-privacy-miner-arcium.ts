@@ -1,25 +1,26 @@
 #!/usr/bin/env ts-node
 /**
- * Continuous Privacy Miner with Arcium MPC Integration
+ * Continuous Privacy GPU Miner with Arcium MPC
  *
- * Interactive miner with menu accessible at any time:
- * - [D] Deposit SOL to encrypted balance
- * - [W] Withdraw SOL from encrypted balance
- * - [L] List pending/unclaimed rewards
- * - [S] Stop mining
- * - [R] Change relayer address
- * - [C] Change claim address
+ * Dashboard TUI (like continuous-gpu-miner) + interactive menu.
  *
- * Flow with Arcium:
- * 1. Mine with GPU (same as regular miner)
- * 2. Generate random secret + destination wallet
- * 3. Encrypt destination with MXE x25519 key (RescueCipher)
- * 4. Submit via pow-privacy -> queues store_claim MPC computation
- * 5. Arcium MPC stores encrypted claim data
- * 6. Claim rewards -> queues verify_and_claim MPC computation
- * 7. MPC verifies secret, decrypts destination, transfers tokens
+ * Architecture:
+ * - MINER (fixed): wallet whose encrypted SOL+HASHISH balances are tracked in MPC
+ * - RELAYERS (pool, random): wallets that pay tx fees for mining submissions
+ * - CLAIMERS (pool): destination wallets for HASHISH withdrawals
  *
- * Destinations are NEVER visible on-chain - only MPC can decrypt them.
+ * Flow:
+ * 1. Mine with GPU (privacyAuthority as miner pubkey)
+ * 2. Pick random relayer to submit block
+ * 3. submit_block_private → mints to sharedTokenVault + MPC mine_block (deducts SOL fee)
+ * 4. deposit_token_private → credits HASHISH reward to encrypted token balance
+ * 5. User withdraws HASHISH to claimer wallets via menu
+ *
+ * Menu sections:
+ * [1] Miners & Funds   - change miner, deposit/withdraw SOL, deposit HASHISH
+ * [2] Relayers          - add/remove/list relayers
+ * [3] Claimers          - add/remove/list claimers, withdraw HASHISH to claimer
+ * [S] Stop              - exit
  */
 
 import * as anchor from "@coral-xyz/anchor";
@@ -31,18 +32,19 @@ import {
   ComputeBudgetProgram,
   TransactionMessage,
   VersionedTransaction,
-  AddressLookupTableAccount
+  AddressLookupTableAccount,
 } from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
-  createAssociatedTokenAccountIdempotent
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountIdempotent,
 } from "@solana/spl-token";
 import {
   getMXEAccAddress,
   getMXEPublicKey,
-  getCompDefAccAddress,
   getCompDefAccOffset,
+  getCompDefAccAddress,
   getMempoolAccAddress,
   getExecutingPoolAccAddress,
   getComputationAccAddress,
@@ -54,1203 +56,319 @@ import {
   getArciumProgramId,
   getFeePoolAccAddress,
   getClockAccAddress,
-  getLookupTableAddress,
 } from "@arcium-hq/client";
-import { spawn, ChildProcess } from 'child_process';
-import { createHash, randomBytes } from 'crypto';
+import { spawn, ChildProcess } from "child_process";
+import { randomBytes } from "crypto";
 import fs from "fs";
-import * as readline from 'readline';
-import { printBalanceStatus } from "./check-miner-balance";
-import * as claimsDb from "./claims-db";
+import readline from "readline";
+import * as db from "./privacy-db";
 
-// Track the current mining process so we can kill it when menu opens
-let currentMiningProcess: ChildProcess | null = null;
+// ============================================================================
+// CONFIG
+// ============================================================================
 
-// Track miner's encrypted balance locally
-// This is a local copy - the canonical balance is in Arcium MPC
-let minerBalanceLamports: bigint = BigInt(0);
-
-// Balance tracking functions
-function loadMinerBalance(): bigint {
-  const balancePath = __dirname + "/../miner-balance.json";
-  if (fs.existsSync(balancePath)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(balancePath, "utf-8"));
-      return BigInt(data.balance || 0);
-    } catch (e) {
-      return BigInt(0);
-    }
-  }
-  return BigInt(0);
-}
-
-function saveMinerBalance(balance: bigint): void {
-  const balancePath = __dirname + "/../miner-balance.json";
-  fs.writeFileSync(balancePath, JSON.stringify({
-    balance: balance.toString(),
-    updatedAt: new Date().toISOString(),
-  }, null, 2));
-}
-
-// Encrypt MinerState (balance, nonce, reserved) for MPC
-// Returns 3 ciphertexts for the 3 u64 fields
-function encryptMinerState(
-  balance: bigint,
-  stateNonce: bigint,
-  reserved: bigint,
-  mxePublicKey: Uint8Array,
-  clientPrivateKey: Uint8Array,
-  nonce: Buffer
-): Uint8Array[] {
-  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
-  const cipher = new RescueCipher(sharedSecret);
-  // Encrypt each field separately as u64
-  const balanceCiphertext = cipher.encrypt([balance], nonce);
-  const nonceCiphertext = cipher.encrypt([stateNonce], nonce);
-  const reservedCiphertext = cipher.encrypt([reserved], nonce);
-  return [
-    Uint8Array.from(balanceCiphertext[0]),
-    Uint8Array.from(nonceCiphertext[0]),
-    Uint8Array.from(reservedCiphertext[0]),
-  ];
-}
-
-// Config
 const useLocal = process.argv.includes("--local");
 const configPath = useLocal
   ? __dirname + "/../miner-config.json"
-  : __dirname + "/../miner-config-devnet.json";
+  : __dirname + "/../miner-config.json";
 const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
-// Program IDs (from pow-programs Anchor.toml devnet)
-const POW_PRIVACY_ID = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
-const TRANSFER_HOOK_PROGRAM_ID = new PublicKey("4Q1SrMmhDhtkgsQiCutmkJxYJ1TWYTm9oh5R3h9tENcZ");
-const POW_PROTOCOL_ID = new PublicKey("Ai9XrxSUmDLNCXkoeoqnYuzPgN9F2PeF9WtLq9GyqER");
+const networkLabel = useLocal ? "localhost" : "devnet";
+const gpuBackend = String(config.gpu_backend ?? process.env.POW_GPU_BACKEND ?? "cuda");
+const challengePollIntervalMs = Math.max(500, Number(config.challenge_poll_interval_ms ?? 1500) || 1500);
+const gpuDevice = Math.max(0, Math.floor(Number(config.gpu_device ?? process.env.POW_GPU_DEVICE ?? 0) || 0));
+const cudaThreadsPerBlock = (() => {
+  const v = Number(config.cuda_threads_per_block ?? process.env.POW_CUDA_THREADS_PER_BLOCK);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : null;
+})();
+const cudaNumBlocks = (() => {
+  const v = Number(config.cuda_num_blocks ?? process.env.POW_CUDA_NUM_BLOCKS);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : null;
+})();
+
+// Program IDs (from Anchor.toml devnet)
+const POW_PRIVACY_ID = new PublicKey("AMmu8GcoNUAdnRNKU5AqgNGdLJSLh9WLxxzxFkdtXwCh");
+const POW_PROTOCOL_ID = new PublicKey("8ShwcqBzuknRJdGP2HoupsMEAMjvyqqwjjWWQmJVHChG");
+const TRANSFER_HOOK_PROGRAM_ID = new PublicKey("95zaGUMvrNFnCpjSqQyTNw3msyJtj9drQ5mWYm1eP6S3");
 const MINT = new PublicKey(config.mint);
 
-// Arcium cluster offset (fallback to devnet v0.6.3 if env not set)
+// Arcium
 const DEFAULT_CLUSTER_OFFSET = 456;
-const ARCIUM_CLUSTER_OFFSET_FROM_ENV =
-  process.env.ARCIUM_CLUSTER_OFFSET !== undefined &&
-  Number.isFinite(Number(process.env.ARCIUM_CLUSTER_OFFSET));
-const ARCIUM_CLUSTER_OFFSET = ARCIUM_CLUSTER_OFFSET_FROM_ENV
+const ARCIUM_CLUSTER_OFFSET = Number.isFinite(Number(process.env.ARCIUM_CLUSTER_OFFSET))
   ? Number(process.env.ARCIUM_CLUSTER_OFFSET)
   : DEFAULT_CLUSTER_OFFSET;
-
-// Arcium program and global accounts (from SDK)
 const ARCIUM_PROGRAM_ID = getArciumProgramId();
 const ARCIUM_FEE_POOL = getFeePoolAccAddress();
 const ARCIUM_CLOCK = getClockAccAddress();
 
-// Seeds for pow-protocol
+// Seeds
 const POW_CONFIG_SEED = Buffer.from("pow_config");
 const POW_FEE_VAULT_SEED = Buffer.from("fee_vault");
 const POW_MINER_STATS_SEED = Buffer.from("miner_stats");
 const POW_MINT_AUTHORITY_SEED = Buffer.from("pow_mint_auth");
-
-// Pool IDs
-const POOL_NORMAL: number = 0;
-const POOL_SEEKER: number = 1;
-
-// Seeds for transfer hook
-const HOOK_EXTRA_ACCOUNT_METAS_SEED = Buffer.from("extra-account-metas");
-const HOOK_FEE_VAULT_SEED = Buffer.from("fee_vault");
-
-// Seeds for pow-privacy
 const PRIVACY_CONFIG_SEED = Buffer.from("privacy_config");
 const PRIVACY_AUTHORITY_SEED = Buffer.from("privacy_authority");
 const SHARED_TOKEN_VAULT_SEED = Buffer.from("shared_token_vault");
 const SHARED_FEE_VAULT_SEED = Buffer.from("shared_fee_vault");
-const CLAIM_SEED = Buffer.from("claim");
-const CLAIM_REQUEST_BUFFER_SEED = Buffer.from("claim_request_buffer");
 const DEPOSIT_BUFFER_SEED = Buffer.from("deposit_buffer");
 const WITHDRAW_BUFFER_SEED = Buffer.from("withdraw_buffer");
-
-// Arcium sign PDA seed
+const DEPOSIT_TOKEN_BUFFER_SEED = Buffer.from("deposit_token_buffer");
+const WITHDRAW_TOKEN_BUFFER_SEED = Buffer.from("withdraw_token_buffer");
 const SIGN_PDA_SEED = Buffer.from("ArciumSignerAccount");
+
+const POOL_NORMAL = 0;
+const POOL_SEEKER = 1;
+
+// Dashboard
+const DASHBOARD_MIN_WIDTH = 76;
+const DASHBOARD_MAX_WIDTH = 104;
+const DASHBOARD_EVENT_LINES = 6;
+const POST_WIN_PAUSE_MS = 600;
+const RETRY_DELAY_MS = 5000;
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+type ProtocolState = {
+  difficulty: bigint;
+  blocksMined: bigint;
+  challenge: Buffer;
+  challengeHex: string;
+};
+
+type GpuMineResult =
+  | { status: "success"; nonce: bigint; hashrate: number; timeMs: number }
+  | { status: "stopped" }
+  | { status: "error"; reason: string; output?: string };
+
+type GpuProgress = { hashesChecked: bigint; liveHashrate: number; avgHashrate: number };
+
+type MinerPhase = "booting" | "syncing" | "ready" | "mining" | "submitting" | "depositing" | "won" | "lost" | "error" | "menu";
+
+type DashboardState = {
+  network: string;
+  backend: string;
+  minerWallet: string;
+  relayerWallet: string;
+  rpcUrl: string;
+  phase: MinerPhase;
+  phaseDetail: string;
+  phaseStartedAt: number;
+  sessionStartedAt: number;
+  spinnerIndex: number;
+  currentState: ProtocolState | null;
+  currentNonce: bigint | null;
+  currentMiningStartedAt: number | null;
+  blocksWon: number;
+  staleBlocks: number;
+  restartCount: number;
+  errorCount: number;
+  liveHashrate: number | null;
+  liveAvgHashrate: number | null;
+  liveHashesChecked: bigint | null;
+  lastHashrate: number | null;
+  totalHashrate: number;
+  hashrateSamples: number;
+  lastMiningTimeMs: number | null;
+  lastTx: string | null;
+  relayerCount: number;
+  claimerCount: number;
+  events: string[];
+};
 
 // ============================================================================
 // GLOBAL STATE
 // ============================================================================
 
-// Store pending claims to process later
-interface PendingClaim {
-  claimId: number;
-  secret: Buffer;
-  destinationWallet: Keypair;
-  destinationPubkey?: string; // For user-defined destinations (may not have secret key)
-  clientPrivateKey: Uint8Array;
-  computationOffset: anchor.BN;
-  amount?: number;
-  createdAt: number;
-}
-
-const pendingClaims: PendingClaim[] = [];
-
-// Mining control
 let isMining = true;
 let menuActive = false;
-
-// Configurable addresses (loaded from DB if available, otherwise from config)
-let minerWalletPath = claimsDb.getMinerWalletPath() ?? config.wallet_path;
-let relayerWalletPath = claimsDb.getRelayerWalletPath() ?? config.relayer_wallet_path ?? config.wallet_path;
-let currentRpcUrl = claimsDb.getRpcUrl() ?? config.rpc_url;
-
-// Load default claim wallet from DB (path to keypair file)
-const savedClaimWalletPath = claimsDb.getClaimDestination();
-let defaultClaimWalletPath: string | null = savedClaimWalletPath ?? null;
-
-// Global claim context (set in main(), used by handleClaimRewards)
-let claimContext: {
-  provider: anchor.AnchorProvider;
-  program: Program;
-  connection: anchor.web3.Connection;
-  wallet: anchor.Wallet;
-  tokenProgramId: PublicKey;
-  privacyConfig: PublicKey;
-  privacyAuthority: PublicKey;
-  sharedTokenVault: PublicKey;
-  mxeAccount: PublicKey;
-  mempoolAccount: PublicKey;
-  executingPool: PublicKey;
-  clusterAccount: PublicKey;
-  signPdaAccount: PublicKey;
-  mxePublicKey: Uint8Array;
-} | null = null;
+let currentMiningProcess: ChildProcess | null = null;
+let minerWalletPath = db.getMinerWalletPath() ?? config.wallet_path;
+let currentRpcUrl = db.getRpcUrl() ?? config.rpc_url;
 
 // ============================================================================
-// MENU SYSTEM
+// HELPERS
 // ============================================================================
 
-function printMenu() {
-  console.log("\n");
-  console.log("╔═══════════════════════════════════════════════════════════════╗");
-  console.log("║                    PRIVACY MINER MENU                         ║");
-  console.log("╠═══════════════════════════════════════════════════════════════╣");
-  console.log("║  [D] Deposit     - Add SOL to your encrypted balance          ║");
-  console.log("║  [W] Withdraw    - Withdraw SOL from encrypted balance        ║");
-  console.log("║  [L] List Claims - Browse & claim pending rewards             ║");
-  console.log("║  [S] Stop        - Stop mining and exit                       ║");
-  console.log("║  [1] Miner       - Change miner wallet (for rewards)          ║");
-  console.log("║  [2] Relayer     - Change relayer wallet (pays fees)          ║");
-  console.log("║  [C] Claim Wallet - Set claim wallet keypair path             ║");
-  console.log("║  [N] RPC         - Change RPC endpoint                        ║");
-  console.log("║  [B] Balance     - Show balance status                        ║");
-  console.log("║  [M] Close Menu  - Return to mining                           ║");
-  console.log("╚═══════════════════════════════════════════════════════════════╝");
-  console.log("");
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function promptUser(question: string): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-  });
-
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
+function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 }
 
-async function handleDeposit(
-  program: Program,
-  mxePublicKey: Uint8Array,
-  privacyConfig: PublicKey,
-  sharedFeeVault: PublicKey,
-  mxeAccount: PublicKey,
-  mempoolAccount: PublicKey,
-  executingPool: PublicKey,
-  clusterAccount: PublicKey,
-  signPdaAccount: PublicKey
-) {
-  // Show current miner wallet info
-  console.log(`\nMiner wallet: ${minerWalletPath}`);
-  try {
-    const minerKeypair = Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8")))
-    );
-    const connection = new anchor.web3.Connection(currentRpcUrl, "confirmed");
-    const balance = await connection.getBalance(minerKeypair.publicKey);
-    console.log(`  Address: ${minerKeypair.publicKey.toString()}`);
-    console.log(`  Balance: ${balance / 1e9} SOL`);
-  } catch (err) {
-    console.log("  (Unable to load miner wallet)");
-    console.log("  Set miner wallet first with option [1]");
+function formatBigInt(v: bigint): string { return v.toLocaleString("en-US"); }
+function formatHashrate(v: number | null): string { return v === null ? "-" : `${v.toFixed(2)} MH/s`; }
+function formatShort(v: string, h = 8, t = 6): string {
+  return v.length <= h + t + 3 ? v : `${v.slice(0, h)}...${v.slice(-t)}`;
+}
+function truncate(v: string, max: number): string {
+  return v.length <= max ? v : max <= 3 ? v.slice(0, max) : `${v.slice(0, max - 3)}...`;
+}
+
+// ============================================================================
+// DASHBOARD TUI
+// ============================================================================
+
+const renderer = { previousLines: [] as string[], active: false, cursorHidden: false };
+
+function dashboardWidth(): number {
+  return process.stdout.isTTY
+    ? Math.min(DASHBOARD_MAX_WIDTH, Math.max(DASHBOARD_MIN_WIDTH, process.stdout.columns ?? DASHBOARD_MIN_WIDTH))
+    : 88;
+}
+
+function boxLine(content: string, w: number): string {
+  return `\u2502 ${truncate(content, w - 4).padEnd(w - 4)} \u2502`;
+}
+
+function dblCol(left: string, right: string, w: number): string {
+  const inner = w - 4;
+  const mid = Math.floor(inner / 2);
+  return `\u2502 ${truncate(left, mid - 1).padEnd(mid - 1)} ${truncate(right, inner - mid).padEnd(inner - mid)} \u2502`;
+}
+
+function buildDashboard(d: DashboardState): string[] {
+  if (!process.stdout.isTTY) return [];
+  const w = dashboardWidth();
+  const spin = ["-", "\\", "|", "/"];
+  d.spinnerIndex = (d.spinnerIndex + 1) % spin.length;
+  const sp = d.phase === "mining" ? spin[d.spinnerIndex] : " ";
+  const s = d.currentState;
+  const avgHr = d.hashrateSamples > 0 ? d.totalHashrate / d.hashrateSamples : null;
+  const uptime = formatDuration(Date.now() - d.sessionStartedAt);
+  const phaseAge = formatDuration(Date.now() - d.phaseStartedAt);
+  const mineElapsed = d.currentMiningStartedAt ? formatDuration(Date.now() - d.currentMiningStartedAt) : "-";
+  const title = " PRIVACY GPU MINER ";
+  const topRule = "\u2500".repeat(Math.max(0, w - title.length - 2));
+  const challenge = s ? `${s.challengeHex.slice(0, 20)}...${s.challengeHex.slice(-8)}` : "-";
+  const block = s ? formatBigInt(s.blocksMined) : "-";
+  const diff = s ? formatBigInt(s.difficulty) : "-";
+
+  const lines = [
+    `\u250C${title}${topRule}\u2510`,
+    boxLine(`${sp} ${d.phase.toUpperCase()}  ${d.phaseDetail}`, w),
+    dblCol(`Phase for : ${phaseAge}`, `Uptime : ${uptime}`, w),
+    dblCol(`Network   : ${d.network}`, `Backend : ${d.backend}`, w),
+    dblCol(`Miner     : ${formatShort(d.minerWallet)}`, `RPC : ${formatShort(d.rpcUrl, 20, 8)}`, w),
+    dblCol(`Relayer   : ${formatShort(d.relayerWallet)}`, `Relayers : ${d.relayerCount}`, w),
+    dblCol(`Block     : ${block}`, `Difficulty : ${diff}`, w),
+    boxLine(`Challenge  : ${challenge}`, w),
+    dblCol(`Mining for: ${mineElapsed}`, `Live : ${formatHashrate(d.liveHashrate)}`, w),
+    dblCol(`Checked   : ${d.liveHashesChecked ? formatBigInt(d.liveHashesChecked) : "-"}`, `Live avg : ${formatHashrate(d.liveAvgHashrate)}`, w),
+    dblCol(`Last nonce: ${d.currentNonce === null ? "-" : d.currentNonce.toString()}`, `Last tx : ${d.lastTx ? formatShort(d.lastTx, 10, 8) : "-"}`, w),
+    dblCol(`Last round: ${d.lastMiningTimeMs ? `${(d.lastMiningTimeMs / 1000).toFixed(2)}s` : "-"}`, `GPU dev : ${gpuDevice}`, w),
+    dblCol(
+      `Session   : wins ${d.blocksWon} | stale ${d.staleBlocks}`,
+      `Claimers : ${d.claimerCount}`,
+      w,
+    ),
+    dblCol(`Hashrate  : last ${formatHashrate(d.lastHashrate)}`, `avg ${formatHashrate(avgHr)}`, w),
+    `\u251C${"\u2500".repeat(w - 2)}\u2524`,
+    boxLine("Recent events  [M] Menu  [Ctrl+C] Quit", w),
+  ];
+  const evts = d.events.length > 0 ? d.events : ["No events yet."];
+  for (let i = 0; i < DASHBOARD_EVENT_LINES; i++) lines.push(boxLine(evts[i] ?? "", w));
+  lines.push(`\u2514${"\u2500".repeat(w - 2)}\u2518`);
+  return lines;
+}
+
+function renderDashboard(d: DashboardState) {
+  if (!process.stdout.isTTY || menuActive) return;
+  const lines = buildDashboard(d);
+  if (lines.length === 0) return;
+
+  if (!renderer.active) {
+    if (!renderer.cursorHidden) { process.stdout.write("\x1b[?25l"); renderer.cursorHidden = true; }
+    process.stdout.write(`${lines.join("\n")}\n`);
+    renderer.previousLines = lines;
+    renderer.active = true;
     return;
   }
 
-  const amountStr = await promptUser("Enter amount in SOL (e.g., 0.1): ");
-  const amountSol = parseFloat(amountStr);
-
-  if (isNaN(amountSol) || amountSol <= 0) {
-    console.log("Invalid amount. Returning to menu.");
-    return;
-  }
-
-  const amountLamports = Math.floor(amountSol * 1e9);
-  console.log(`\nDepositing ${amountSol} SOL (${amountLamports} lamports)...`);
-
-  try {
-    // Load miner wallet (the one that pays for the deposit)
-    const minerKeypair = Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8")))
-    );
-    const minerWallet = new anchor.Wallet(minerKeypair);
-    const connection = new anchor.web3.Connection(currentRpcUrl, "confirmed");
-    const minerProvider = new anchor.AnchorProvider(connection, minerWallet, { commitment: "confirmed" });
-
-    // Create program with miner wallet
-    const idl = JSON.parse(fs.readFileSync(__dirname + "/../target/idl/pow_privacy.json", "utf-8"));
-    const minerProgram = new Program(idl, minerProvider);
-
-    const clientPrivateKey = x25519.utils.randomSecretKey();
-    const clientPublicKey = x25519.getPublicKey(clientPrivateKey);
-    const nonce = randomBytes(16);
-
-    // Encrypt amount (single u64 ciphertext)
-    const encryptedAmount = encryptAmount(
-      BigInt(amountLamports),
-      mxePublicKey,
-      clientPrivateKey,
-      nonce
-    );
-
-    // Encrypt current miner state (balance, nonce, reserved) - 3 x u64 ciphertexts
-    const minerState = loadMinerState();
-    const encryptedState = encryptCurrentState(
-      minerState.balance,
-      minerState.stateNonce,
-      minerState.reserved,
-      mxePublicKey,
-      clientPrivateKey,
-      nonce
-    );
-
-    // Convert to expected format
-    const encryptedAmountArray: number[] = Array.from(encryptedAmount);
-    const encryptedCurrentStateArray: number[][] = encryptedState.map(c => Array.from(c));
-
-    // Derive deposit buffer PDA (using first 8 bytes of encrypted_amount)
-    const [depositBufferPda] = PublicKey.findProgramAddressSync(
-      [DEPOSIT_BUFFER_SEED, minerWallet.publicKey.toBuffer(), encryptedAmount.slice(0, 8)],
-      POW_PRIVACY_ID
-    );
-
-    console.log("Creating deposit buffer...");
-    const createBufferTx = await minerProgram.methods
-      .createDepositBuffer(
-        encryptedAmountArray,
-        encryptedCurrentStateArray,
-        Array.from(clientPublicKey),
-        new anchor.BN(deserializeLE(nonce).toString()),
-        new anchor.BN(amountLamports),
-      )
-      .accounts({
-        depositor: minerWallet.publicKey,
-        privacyConfig: privacyConfig,
-        depositBuffer: depositBufferPda,
-        systemProgram: SystemProgram.programId,
-      })
-      .rpc();
-
-    console.log(`Buffer created: ${createBufferTx.slice(0, 20)}...`);
-
-    // Execute deposit with MPC
-    console.log("Executing deposit via MPC...");
-    const computationOffset = new anchor.BN(randomBytes(8), "hex");
-    const depositFeeOffset = Buffer.from(getCompDefAccOffset("deposit_fee")).readUInt32LE();
-    const compDefAccount = getCompDefAccAddress(POW_PRIVACY_ID, depositFeeOffset);
-    const computationAccount = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, computationOffset);
-
-    const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 });
-
-    const depositTx = await minerProgram.methods
-      .depositPrivate(computationOffset)
-      .accounts({
-        depositor: minerWallet.publicKey,
-        privacyConfig: privacyConfig,
-        depositBuffer: depositBufferPda,
-        owner: minerWallet.publicKey,
-        sharedFeeVault: sharedFeeVault,
-        systemProgram: SystemProgram.programId,
-        signPdaAccount: signPdaAccount,
-        mxeAccount: mxeAccount,
-        mempoolAccount: mempoolAccount,
-        executingPool: executingPool,
-        computationAccount: computationAccount,
-        compDefAccount: compDefAccount,
-        clusterAccount: clusterAccount,
-        poolAccount: ARCIUM_FEE_POOL,
-        clockAccount: ARCIUM_CLOCK,
-        arciumProgram: ARCIUM_PROGRAM_ID,
-      })
-      .preInstructions([computeBudgetIx])
-      .rpc({ skipPreflight: true });
-
-    console.log(`Deposit queued: ${depositTx.slice(0, 20)}...`);
-
-    // Wait for MPC
-    console.log("Waiting for MPC confirmation...");
-    try {
-      const finalizeSig = await awaitComputationFinalization(
-        minerProvider, computationOffset, POW_PRIVACY_ID, "confirmed"
-      );
-      console.log(`MPC finalized: ${finalizeSig.slice(0, 20)}...`);
-      console.log(`\n✓ Deposit successful! ${amountSol} SOL added to your encrypted balance.`);
-    } catch (e) {
-      console.log("MPC timeout - deposit may still complete in background");
+  readline.moveCursor(process.stdout, 0, -renderer.previousLines.length);
+  for (let i = 0; i < lines.length; i++) {
+    readline.cursorTo(process.stdout, 0);
+    if (renderer.previousLines[i] !== lines[i]) {
+      readline.clearLine(process.stdout, 0);
+      process.stdout.write(lines[i]);
     }
-  } catch (err: any) {
-    console.error("Deposit failed:", err?.message || err);
+    if (i < lines.length - 1) readline.moveCursor(process.stdout, 0, 1);
   }
+  readline.cursorTo(process.stdout, 0);
+  process.stdout.write("\n");
+  renderer.previousLines = lines;
 }
 
-async function handleWithdraw(
-  mxePublicKey: Uint8Array,
-  privacyConfig: PublicKey,
-  sharedFeeVault: PublicKey,
-  mxeAccount: PublicKey,
-  mempoolAccount: PublicKey,
-  executingPool: PublicKey,
-  clusterAccount: PublicKey,
-  signPdaAccount: PublicKey
-) {
-  // Show current miner wallet info
-  console.log(`\nMiner wallet: ${minerWalletPath}`);
-  try {
-    const minerKeypair = Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8")))
-    );
-    console.log(`  Address: ${minerKeypair.publicKey.toString()}`);
-  } catch (err) {
-    console.log("  (Unable to load miner wallet)");
-    console.log("  Set miner wallet first with option [1]");
-    return;
-  }
+function startDashboardRenderer(d: DashboardState): () => void {
+  if (!process.stdout.isTTY) return () => undefined;
+  renderDashboard(d);
+  const timer = setInterval(() => { if (!menuActive) renderDashboard(d); }, 1000);
+  return () => {
+    clearInterval(timer);
+    if (renderer.cursorHidden) { process.stdout.write("\x1b[?25h"); renderer.cursorHidden = false; }
+    renderer.active = false;
+    renderer.previousLines = [];
+  };
+}
 
-  const amountStr = await promptUser("Enter amount in SOL (e.g., 0.1): ");
-  const amountSol = parseFloat(amountStr);
-
-  if (isNaN(amountSol) || amountSol <= 0) {
-    console.log("Invalid amount. Returning to menu.");
-    return;
-  }
-
-  const amountLamports = Math.floor(amountSol * 1e9);
-
-  let destinationStr = await promptUser("Destination address (leave empty for new random wallet): ");
-  let destination: PublicKey;
-
-  if (destinationStr === "" || destinationStr === null) {
-    const newWallet = Keypair.generate();
-    destination = newWallet.publicKey;
-
-    // Save the new wallet
-    const walletsDir = __dirname + "/../wallets-privacy";
-    if (!fs.existsSync(walletsDir)) fs.mkdirSync(walletsDir);
-    const timestamp = Date.now();
-    fs.writeFileSync(
-      `${walletsDir}/withdraw-${timestamp}.json`,
-      JSON.stringify(Array.from(newWallet.secretKey))
-    );
-    console.log(`New wallet created and saved to wallets-privacy/withdraw-${timestamp}.json`);
+function setPhase(d: DashboardState, phase: MinerPhase, detail: string) {
+  d.phase = phase;
+  d.phaseDetail = detail;
+  d.phaseStartedAt = Date.now();
+  if (phase === "mining") {
+    d.currentMiningStartedAt = Date.now();
   } else {
-    try {
-      destination = new PublicKey(destinationStr);
-    } catch {
-      console.log("Invalid address. Returning to menu.");
-      return;
-    }
-  }
-
-  console.log(`\nWithdrawing ${amountSol} SOL to ${destination.toString().slice(0, 20)}...`);
-
-  try {
-    // Load miner wallet (the one that owns the encrypted balance)
-    const minerKeypair = Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8")))
-    );
-    const minerWallet = new anchor.Wallet(minerKeypair);
-    const connection = new anchor.web3.Connection(currentRpcUrl, "confirmed");
-    const minerProvider = new anchor.AnchorProvider(connection, minerWallet, { commitment: "confirmed" });
-
-    // Create program with miner wallet
-    const idl = JSON.parse(fs.readFileSync(__dirname + "/../target/idl/pow_privacy.json", "utf-8"));
-    const minerProgram = new Program(idl, minerProvider);
-
-    const clientPrivateKey = x25519.utils.randomSecretKey();
-    const clientPublicKey = x25519.getPublicKey(clientPrivateKey);
-    const nonce = randomBytes(16);
-
-    // Encrypt amount (single u64 ciphertext)
-    const encryptedAmount = encryptAmount(
-      BigInt(amountLamports),
-      mxePublicKey,
-      clientPrivateKey,
-      nonce
-    );
-
-    // Encrypt destination (4 x u64 ciphertexts)
-    const encryptedDestination = encryptDestinationForWithdraw(
-      destination,
-      mxePublicKey,
-      clientPrivateKey,
-      nonce
-    );
-
-    // Encrypt current miner state (balance, nonce, reserved) - 3 x u64 ciphertexts
-    const minerState = loadMinerState();
-    const encryptedState = encryptCurrentState(
-      minerState.balance,
-      minerState.stateNonce,
-      minerState.reserved,
-      mxePublicKey,
-      clientPrivateKey,
-      nonce
-    );
-
-    // Convert to expected format
-    const encryptedAmountArray: number[] = Array.from(encryptedAmount);
-    const encryptedDestinationArray: number[][] = encryptedDestination.map(c => Array.from(c));
-    const encryptedCurrentStateArray: number[][] = encryptedState.map(c => Array.from(c));
-
-    // Derive withdraw buffer PDA (using first 8 bytes of encrypted_amount)
-    const [withdrawBufferPda] = PublicKey.findProgramAddressSync(
-      [WITHDRAW_BUFFER_SEED, minerWallet.publicKey.toBuffer(), encryptedAmount.slice(0, 8)],
-      POW_PRIVACY_ID
-    );
-
-    console.log("Creating withdraw buffer...");
-    const createBufferTx = await minerProgram.methods
-      .createWithdrawBuffer(
-        encryptedAmountArray,
-        encryptedDestinationArray,
-        encryptedCurrentStateArray,
-        Array.from(clientPublicKey),
-        new anchor.BN(deserializeLE(nonce).toString()),
-        new anchor.BN(amountLamports),
-      )
-      .accounts({
-        creator: minerWallet.publicKey,
-        privacyConfig: privacyConfig,
-        withdrawBuffer: withdrawBufferPda,
-        systemProgram: SystemProgram.programId,
-      })
-      .rpc();
-
-    console.log(`Buffer created: ${createBufferTx.slice(0, 20)}...`);
-
-    // Execute withdrawal with MPC
-    console.log("Executing withdrawal via MPC...");
-    const computationOffset = new anchor.BN(randomBytes(8), "hex");
-    const withdrawFeeOffset = Buffer.from(getCompDefAccOffset("withdraw_fee")).readUInt32LE();
-    const compDefAccount = getCompDefAccAddress(POW_PRIVACY_ID, withdrawFeeOffset);
-    const computationAccount = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, computationOffset);
-
-    const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 });
-
-    const withdrawTx = await minerProgram.methods
-      .withdrawPrivate(computationOffset)
-      .accounts({
-        caller: minerWallet.publicKey,
-        privacyConfig: privacyConfig,
-        withdrawBuffer: withdrawBufferPda,
-        sharedFeeVault: sharedFeeVault,
-        destination: destination,
-        systemProgram: SystemProgram.programId,
-        signPdaAccount: signPdaAccount,
-        mxeAccount: mxeAccount,
-        mempoolAccount: mempoolAccount,
-        executingPool: executingPool,
-        computationAccount: computationAccount,
-        compDefAccount: compDefAccount,
-        clusterAccount: clusterAccount,
-        poolAccount: ARCIUM_FEE_POOL,
-        clockAccount: ARCIUM_CLOCK,
-        arciumProgram: ARCIUM_PROGRAM_ID,
-      })
-      .preInstructions([computeBudgetIx])
-      .rpc({ skipPreflight: true });
-
-    console.log(`Withdrawal queued: ${withdrawTx.slice(0, 20)}...`);
-
-    // Wait for MPC
-    console.log("Waiting for MPC verification...");
-    try {
-      const finalizeSig = await awaitComputationFinalization(
-        minerProvider, computationOffset, POW_PRIVACY_ID, "confirmed"
-      );
-      console.log(`MPC finalized: ${finalizeSig.slice(0, 20)}...`);
-      console.log(`\n✓ Withdrawal successful! ${amountSol} SOL sent to ${destination.toString()}`);
-    } catch (e) {
-      console.log("MPC timeout - withdrawal may still complete in background");
-    }
-  } catch (err: any) {
-    console.error("Withdrawal failed:", err?.message || err);
+    d.currentMiningStartedAt = null;
+    d.liveHashrate = null;
+    d.liveAvgHashrate = null;
+    d.liveHashesChecked = null;
   }
 }
 
-async function handleListClaims() {
-  const PAGE_SIZE = 10;
-  let currentPage = 0;
-
-  while (true) {
-    // Get pending claims from database
-    const dbClaims = claimsDb.getPendingClaims();
-    const totalPages = Math.ceil(dbClaims.length / PAGE_SIZE) || 1;
-    const start = currentPage * PAGE_SIZE;
-    const pageClaims = dbClaims.slice(start, start + PAGE_SIZE);
-
-    console.log("\n");
-    console.log("╔═══════════════════════════════════════════════════════════════╗");
-    console.log("║                    CLAIMS DATABASE                            ║");
-    console.log("╠═══════════════════════════════════════════════════════════════╣");
-
-    // Get stats from database
-    const stats = claimsDb.getClaimStats();
-    console.log(`║  Total: ${stats.total.toString().padEnd(6)} | Claimed: ${stats.claimed.toString().padEnd(6)} | Failed: ${stats.failed.toString().padEnd(6)}   ║`);
-    console.log(`║  Pending: ${stats.pending.toString().padEnd(4)} | MPC OK: ${stats.mpcConfirmed.toString().padEnd(5)} | Expired: ${stats.expired.toString().padEnd(5)}  ║`);
-    console.log("╠═══════════════════════════════════════════════════════════════╣");
-
-    if (dbClaims.length === 0) {
-      console.log("║  No pending claims in database                                ║");
-    } else {
-      console.log(`║  PENDING CLAIMS (Page ${currentPage + 1}/${totalPages}):                               ║`);
-      console.log("║  ─────────────────────────────────────────────────────────    ║");
-      for (let i = 0; i < pageClaims.length; i++) {
-        const claim = pageClaims[i];
-        const age = Math.floor((Date.now() / 1000) - claim.created_at);
-        const dest = claim.destination_pubkey.slice(0, 10);
-        const statusMap: Record<string, string> = {
-          'pending': 'Pending',
-          'mpc_confirmed': 'MPC OK',
-          'claiming': 'Claiming',
-          'failed': `Fail(${claim.retry_count})`,
-        };
-        const status = statusMap[claim.status] || claim.status;
-        const idx = (i + 1).toString().padStart(2, ' ');
-        console.log(`║  [${idx}] #${claim.claim_id.toString().padEnd(5)} | ${dest}... | ${age.toString().padStart(5)}s | ${status.padEnd(10)}║`);
-      }
-    }
-
-    console.log("╠═══════════════════════════════════════════════════════════════╣");
-    console.log("║  [N] Next page  [P] Prev page  [A] Claim All  [Q] Back        ║");
-    console.log("║  [1-10] Select claim to process individually                  ║");
-    console.log("╚═══════════════════════════════════════════════════════════════╝");
-
-    const choice = await promptUser("Enter choice: ");
-    const upperChoice = choice.toUpperCase();
-
-    if (upperChoice === 'Q' || upperChoice === '') {
-      break;
-    } else if (upperChoice === 'N') {
-      if (currentPage < totalPages - 1) currentPage++;
-      else console.log("Already on last page.");
-    } else if (upperChoice === 'P') {
-      if (currentPage > 0) currentPage--;
-      else console.log("Already on first page.");
-    } else if (upperChoice === 'A') {
-      // Claim all pending
-      await handleClaimAll();
-    } else {
-      // Try to parse as number for individual claim
-      const num = parseInt(choice, 10);
-      if (!isNaN(num) && num >= 1 && num <= pageClaims.length) {
-        const selectedClaim = pageClaims[num - 1];
-        await handleClaimSingle(selectedClaim.claim_id);
-      } else {
-        console.log("Invalid choice.");
-      }
-    }
-  }
+function pushEvent(d: DashboardState, msg: string) {
+  const time = new Date().toLocaleTimeString("en-GB", { hour12: false });
+  d.events = [`${time}  ${msg}`, ...d.events].slice(0, DASHBOARD_EVENT_LINES);
 }
 
-async function handleClaimSingle(claimId: number) {
-  if (!claimContext) {
-    console.log("\nClaim context not initialized. Wait for miner to fully start.");
-    return;
-  }
-
-  const dbClaim = claimsDb.getClaimByClaimId(claimId);
-  if (!dbClaim) {
-    console.log(`\nClaim #${claimId} not found in database.`);
-    return;
-  }
-
-  if (dbClaim.status === 'claimed') {
-    console.log(`\nClaim #${claimId} already claimed.`);
-    return;
-  }
-
-  const age = Math.floor((Date.now() / 1000) - dbClaim.created_at);
-  if (age < 30) {
-    console.log(`\nClaim #${claimId} is too recent (${age}s old). Wait at least 30s.`);
-    return;
-  }
-
-  console.log(`\nProcessing claim #${claimId}...`);
-
-  // Convert to claim format and process
-  const claim = claimsDb.claimRecordToPendingClaim(dbClaim);
-
-  try {
-    await processSingleClaim(
-      claimContext.provider,
-      claimContext.program,
-      claimContext.connection,
-      claimContext.wallet,
-      claimContext.tokenProgramId,
-      claimContext.privacyConfig,
-      claimContext.privacyAuthority,
-      claimContext.sharedTokenVault,
-      claimContext.mxeAccount,
-      claimContext.mempoolAccount,
-      claimContext.executingPool,
-      claimContext.clusterAccount,
-      claimContext.signPdaAccount,
-      claimContext.mxePublicKey,
-      claim
-    );
-    console.log(`\n✓ Claim #${claimId} processed successfully!`);
-  } catch (err: any) {
-    console.log(`\n✗ Failed to claim #${claimId}: ${err?.message || err}`);
-  }
-}
-
-async function handleClaimAll() {
-  if (!claimContext) {
-    console.log("\nClaim context not initialized. Wait for miner to fully start.");
-    return;
-  }
-
-  const readyClaims = claimsDb.getClaimsReadyToProcess(30);
-
-  if (readyClaims.length === 0) {
-    console.log("\nNo claims ready to process (must be >30s old).");
-    return;
-  }
-
-  const confirm = await promptUser(`Process ${readyClaims.length} claims? (y/N): `);
-  if (confirm.toLowerCase() !== 'y') {
-    console.log("Cancelled.");
-    return;
-  }
-
-  console.log(`\nProcessing ${readyClaims.length} pending claims...`);
-
-  await processPendingClaims(
-    claimContext.provider,
-    claimContext.program,
-    claimContext.connection,
-    claimContext.wallet,
-    claimContext.tokenProgramId,
-    claimContext.privacyConfig,
-    claimContext.privacyAuthority,
-    claimContext.sharedTokenVault,
-    claimContext.mxeAccount,
-    claimContext.mempoolAccount,
-    claimContext.executingPool,
-    claimContext.clusterAccount,
-    claimContext.signPdaAccount,
-    claimContext.mxePublicKey
-  );
-
-  console.log("\nClaim processing complete.");
-  const stats = claimsDb.getClaimStats();
-  console.log(`Pending: ${stats.pending} | Claimed: ${stats.claimed} | Failed: ${stats.failed}`);
-}
-
-async function handleChangeMinerWallet() {
-  console.log(`\nCurrent miner wallet: ${minerWalletPath}`);
-  try {
-    const currentKeypair = Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8")))
-    );
-    console.log(`  Address: ${currentKeypair.publicKey.toString()}`);
-  } catch {
-    console.log("  (Unable to load current wallet)");
-  }
-
-  const newPath = await promptUser("Enter new miner wallet path (or empty to cancel): ");
-
-  if (newPath === "") {
-    console.log("Cancelled.");
-    return;
-  }
-
-  if (!fs.existsSync(newPath)) {
-    console.log("File not found. Keeping current miner wallet.");
-    return;
-  }
-
-  try {
-    const keypair = Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(newPath, "utf-8")))
-    );
-    minerWalletPath = newPath;
-    claimsDb.setMinerWalletPath(newPath);
-    console.log(`\n✓ Miner wallet changed to: ${keypair.publicKey.toString()}`);
-    console.log("  Saved to database. Will persist across restarts.");
-    console.log("  Note: RESTART the miner for the change to take full effect.");
-  } catch (err) {
-    console.log("Invalid keypair file. Keeping current miner wallet.");
-  }
-}
-
-async function handleChangeRelayer() {
-  console.log(`\nCurrent relayer wallet: ${relayerWalletPath}`);
-  try {
-    const currentKeypair = Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(relayerWalletPath, "utf-8")))
-    );
-    console.log(`  Address: ${currentKeypair.publicKey.toString()}`);
-  } catch {
-    console.log("  (Unable to load current wallet)");
-  }
-
-  const newPath = await promptUser("Enter new relayer wallet path (or empty to cancel): ");
-
-  if (newPath === "") {
-    console.log("Cancelled.");
-    return;
-  }
-
-  if (!fs.existsSync(newPath)) {
-    console.log("File not found. Keeping current relayer.");
-    return;
-  }
-
-  try {
-    const keypair = Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(newPath, "utf-8")))
-    );
-    relayerWalletPath = newPath;
-    claimsDb.setRelayerWalletPath(newPath);
-    console.log(`\n✓ Relayer changed to: ${keypair.publicKey.toString()}`);
-    console.log("  Saved to database. Will persist across restarts.");
-    console.log("  Note: RESTART the miner for the change to take full effect.");
-  } catch (err) {
-    console.log("Invalid keypair file. Keeping current relayer.");
-  }
-}
-
-async function handleChangeClaimWallet() {
-  console.log(`\nCurrent claim wallet: ${defaultClaimWalletPath || "None (random keypair per block)"}`);
-  if (defaultClaimWalletPath) {
-    try {
-      const keypair = Keypair.fromSecretKey(
-        new Uint8Array(JSON.parse(fs.readFileSync(defaultClaimWalletPath, "utf-8")))
-      );
-      console.log(`  Address: ${keypair.publicKey.toString()}`);
-    } catch {
-      console.log("  (Unable to load current wallet)");
-    }
-  }
-
-  const newPath = await promptUser("Enter claim wallet path (or 'random' to use random keypairs): ");
-
-  if (newPath === "" || newPath.toLowerCase() === "random") {
-    defaultClaimWalletPath = null;
-    claimsDb.clearClaimDestination();
-    console.log("\n✓ Claim wallet cleared. Each block will use a random keypair.");
-    console.log("  Saved to database. Will persist across restarts.");
-    return;
-  }
-
-  if (!fs.existsSync(newPath)) {
-    console.log("File not found. Keeping current setting.");
-    return;
-  }
-
-  try {
-    const keypair = Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(newPath, "utf-8")))
-    );
-    defaultClaimWalletPath = newPath;
-    claimsDb.setClaimDestination(newPath);
-    console.log(`\n✓ Claim wallet set to: ${keypair.publicKey.toString()}`);
-    console.log("  Saved to database. Will persist across restarts.");
-  } catch {
-    console.log("Invalid keypair file. Keeping current setting.");
-  }
-}
-
-async function handleChangeRpc() {
-  console.log(`\nCurrent RPC: ${currentRpcUrl}`);
-  console.log("\nCommon RPC endpoints:");
-  console.log("  [1] https://api.devnet.solana.com");
-  console.log("  [2] https://api.mainnet-beta.solana.com");
-  console.log("  [3] Custom URL");
-
-  const choice = await promptUser("Enter choice (1-3 or custom URL): ");
-
-  let newRpc: string;
-  switch (choice) {
-    case '1':
-      newRpc = "https://api.devnet.solana.com";
-      break;
-    case '2':
-      newRpc = "https://api.mainnet-beta.solana.com";
-      break;
-    case '3':
-      newRpc = await promptUser("Enter custom RPC URL: ");
-      break;
-    default:
-      if (choice.startsWith('http')) {
-        newRpc = choice;
-      } else {
-        console.log("Invalid choice. Keeping current RPC.");
-        return;
-      }
-  }
-
-  if (!newRpc || newRpc === "") {
-    console.log("Cancelled. Keeping current RPC.");
-    return;
-  }
-
-  // Test the new RPC
-  console.log(`\nTesting RPC: ${newRpc}...`);
-  try {
-    const testConnection = new anchor.web3.Connection(newRpc, "confirmed");
-    const slot = await testConnection.getSlot();
-    console.log(`✓ RPC working! Current slot: ${slot}`);
-
-    currentRpcUrl = newRpc;
-    claimsDb.setRpcUrl(newRpc);
-    console.log(`\n✓ RPC changed to: ${currentRpcUrl}`);
-    console.log("  Saved to database. Will persist across restarts.");
-    console.log("  Note: RESTART the miner for the change to take full effect.");
-  } catch (err: any) {
-    console.log(`✗ Failed to connect to RPC: ${err?.message || err}`);
-    console.log("Keeping current RPC.");
-  }
-}
-
-/**
- * Show current mining status when returning from menu
- */
-async function showMiningStatus(
-  connection: anchor.web3.Connection,
-  privacyConfig: PublicKey,
-  program: Program
-) {
-  try {
-    // Get pow config
-    const [powConfig] = PublicKey.findProgramAddressSync(
-      [POW_CONFIG_SEED],
-      POW_PROTOCOL_ID
-    );
-    const powConfigAccount = await connection.getAccountInfo(powConfig);
-
-    if (powConfigAccount) {
-      const data = powConfigAccount.data;
-      const difficultyLow = data.readBigUInt64LE(72);
-      const difficultyHigh = data.readBigUInt64LE(80);
-      const difficulty = BigInt(difficultyLow) | (BigInt(difficultyHigh) << 64n);
-      const blocksMined = data.readBigUInt64LE(96);
-      const challenge = Buffer.from(data.slice(112, 144));
-
-      console.log("\n===============================================================");
-      console.log("                    MINING RESUMED");
-      console.log("===============================================================");
-      console.log(`Block #${blocksMined} | Difficulty: ${difficulty.toLocaleString()}`);
-      console.log(`Challenge: ${challenge.toString("hex").substring(0, 16)}...`);
-      console.log(`Pending claims: ${pendingClaims.length}`);
-      console.log("Press 'M' at any time to open the menu, Ctrl+C to exit");
-      console.log("===============================================================\n");
-    }
-  } catch (err) {
-    console.log("\nMining resumed. Press 'M' for menu.\n");
-  }
-}
-
-async function handleMenu(
-  provider: anchor.AnchorProvider,
-  program: Program,
-  connection: anchor.web3.Connection,
-  wallet: anchor.Wallet,
-  mxePublicKey: Uint8Array,
-  privacyConfig: PublicKey,
-  sharedFeeVault: PublicKey,
-  mxeAccount: PublicKey,
-  mempoolAccount: PublicKey,
-  executingPool: PublicKey,
-  clusterAccount: PublicKey,
-  signPdaAccount: PublicKey
-) {
-  menuActive = true;
-  killMiningProcess(); // Stop any ongoing GPU mining
-  printMenu();
-
-  while (menuActive) {
-    const choice = await promptUser("Enter choice: ");
-
-    switch (choice.toUpperCase()) {
-      case 'D':
-        await handleDeposit(
-          program, mxePublicKey,
-          privacyConfig, sharedFeeVault, mxeAccount,
-          mempoolAccount, executingPool, clusterAccount, signPdaAccount
-        );
-        printMenu();
-        break;
-
-      case 'W':
-        await handleWithdraw(
-          mxePublicKey,
-          privacyConfig, sharedFeeVault, mxeAccount,
-          mempoolAccount, executingPool, clusterAccount, signPdaAccount
-        );
-        printMenu();
-        break;
-
-      case 'L':
-        await handleListClaims();
-        printMenu();
-        break;
-
-      case 'N':
-        await handleChangeRpc();
-        printMenu();
-        break;
-
-      case 'S':
-        console.log("\nStopping miner...");
-        isMining = false;
-        menuActive = false;
-        break;
-
-      case '1':
-        await handleChangeMinerWallet();
-        printMenu();
-        break;
-
-      case '2':
-        await handleChangeRelayer();
-        printMenu();
-        break;
-
-      case 'C':
-        await handleChangeClaimWallet();
-        break;
-
-      case 'B':
-        await printBalanceStatus(connection);
-        break;
-
-      case 'M':
-      case '':
-        menuActive = false;
-        console.log("\nReturning to mining...");
-        // Re-enable raw mode for keyboard listener
-        if (process.stdin.isTTY) {
-          process.stdin.setRawMode(true);
-          process.stdin.resume();
-        }
-        // Show current mining status
-        await showMiningStatus(connection, privacyConfig, program);
-        break;
-
-      default:
-        console.log("Invalid choice. Try again.");
-    }
-  }
-}
-
-// Setup keyboard listener for menu
-function setupKeyboardListener(
-  provider: anchor.AnchorProvider,
-  program: Program,
-  connection: anchor.web3.Connection,
-  wallet: anchor.Wallet,
-  mxePublicKey: Uint8Array,
-  privacyConfig: PublicKey,
-  sharedFeeVault: PublicKey,
-  mxeAccount: PublicKey,
-  mempoolAccount: PublicKey,
-  executingPool: PublicKey,
-  clusterAccount: PublicKey,
-  signPdaAccount: PublicKey
-) {
-  // Enable raw mode to capture single keypresses
-  if (process.stdin.isTTY) {
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.setEncoding('utf8');
-
-    process.stdin.on('data', async (key: string) => {
-      // Ctrl+C to exit
-      if (key === '\u0003') {
-        console.log("\nExiting...");
-        process.exit();
-      }
-
-      // 'm' or 'M' to open menu (only when not already in menu)
-      if ((key === 'm' || key === 'M') && !menuActive) {
-        await handleMenu(
-          provider, program, connection, wallet, mxePublicKey,
-          privacyConfig, sharedFeeVault, mxeAccount,
-          mempoolAccount, executingPool, clusterAccount, signPdaAccount
-        );
-      }
-    });
-
-    console.log("Press 'M' at any time to open the menu, Ctrl+C to exit\n");
-  }
+function createDashboardState(): DashboardState {
+  return {
+    network: networkLabel, backend: gpuBackend.toUpperCase(),
+    minerWallet: "-", relayerWallet: "-", rpcUrl: currentRpcUrl,
+    phase: "booting", phaseDetail: "Loading...",
+    phaseStartedAt: Date.now(), sessionStartedAt: Date.now(), spinnerIndex: 0,
+    currentState: null, currentNonce: null, currentMiningStartedAt: null,
+    blocksWon: 0, staleBlocks: 0, restartCount: 0, errorCount: 0,
+    liveHashrate: null, liveAvgHashrate: null, liveHashesChecked: null,
+    lastHashrate: null, totalHashrate: 0, hashrateSamples: 0,
+    lastMiningTimeMs: null, lastTx: null,
+    relayerCount: 0, claimerCount: 0, events: [],
+  };
 }
 
 // ============================================================================
-// ENCRYPTION HELPERS
+// PROTOCOL STATE
 // ============================================================================
 
-function encryptDestinationForWithdraw(
-  destination: PublicKey,
-  mxePublicKey: Uint8Array,
-  clientPrivateKey: Uint8Array,
-  nonce: Buffer
-): Uint8Array[] {
-  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
-  const cipher = new RescueCipher(sharedSecret);
-
-  const destBytes = destination.toBuffer();
-  const values = [
-    BigInt("0x" + Buffer.from(destBytes.slice(0, 8)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(destBytes.slice(8, 16)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(destBytes.slice(16, 24)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(destBytes.slice(24, 32)).reverse().toString("hex")),
-  ];
-
-  const ciphertextRaw = cipher.encrypt(values, nonce);
-  return ciphertextRaw.map(chunk => Uint8Array.from(chunk));
-}
-
-function encryptAmount(
-  amount: bigint,
-  mxePublicKey: Uint8Array,
-  clientPrivateKey: Uint8Array,
-  nonce: Buffer
-): Uint8Array {
-  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
-  const cipher = new RescueCipher(sharedSecret);
-  const ciphertextRaw = cipher.encrypt([amount], nonce);
-  return Uint8Array.from(ciphertextRaw[0]);
-}
-
-// Encrypt current MinerState (balance, nonce, reserved) - 3 x u64 ciphertexts
-// The miner state is tracked locally and updated after each MPC computation
-function encryptCurrentState(
-  balance: bigint,
-  stateNonce: bigint,
-  reserved: bigint,
-  mxePublicKey: Uint8Array,
-  clientPrivateKey: Uint8Array,
-  nonce: Buffer
-): Uint8Array[] {
-  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
-  const cipher = new RescueCipher(sharedSecret);
-  const ciphertextRaw = cipher.encrypt([balance, stateNonce, reserved], nonce);
-  return ciphertextRaw.map(chunk => Uint8Array.from(chunk));
-}
-
-// Load miner's current encrypted state from local storage
-// Returns {balance, nonce, reserved} - initially all zeros for new miners
-function loadMinerState(): { balance: bigint; stateNonce: bigint; reserved: bigint } {
-  const statePath = __dirname + "/../miner-state.json";
-  if (fs.existsSync(statePath)) {
-    const data = JSON.parse(fs.readFileSync(statePath, "utf-8"));
-    return {
-      balance: BigInt(data.balance || "0"),
-      stateNonce: BigInt(data.nonce || "0"),
-      reserved: BigInt(data.reserved || "0"),
-    };
-  }
-  return { balance: 0n, stateNonce: 0n, reserved: 0n };
-}
-
-function saveMinerState(balance: bigint, stateNonce: bigint, reserved: bigint) {
-  const statePath = __dirname + "/../miner-state.json";
-  fs.writeFileSync(statePath, JSON.stringify({
-    balance: balance.toString(),
-    nonce: stateNonce.toString(),
-    reserved: reserved.toString(),
-  }, null, 2));
-}
-
-// ============================================================================
-// CRYPTO HELPERS (for mining)
-// ============================================================================
-
-function generateSecret(): Buffer {
-  return randomBytes(32);
-}
-
-function hashSecret(secret: Buffer): Buffer {
-  return createHash('sha256').update(secret).digest();
-}
-
-function generateDestinationWallet(): Keypair {
-  return Keypair.generate();
-}
-
-// Encrypt destination wallet pubkey for Arcium MPC
-function encryptDestination(
-  destinationPubkey: PublicKey,
-  mxePublicKey: Uint8Array,
-  clientPrivateKey: Uint8Array
-): { ciphertext: Uint8Array[]; clientPublicKey: Uint8Array; nonce: Buffer } {
-  const clientPublicKey = x25519.getPublicKey(clientPrivateKey);
-  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
-  const cipher = new RescueCipher(sharedSecret);
-
-  const destBytes = destinationPubkey.toBuffer();
-  const destValues = [
-    BigInt("0x" + destBytes.slice(0, 8).reverse().toString("hex")),
-    BigInt("0x" + destBytes.slice(8, 16).reverse().toString("hex")),
-    BigInt("0x" + destBytes.slice(16, 24).reverse().toString("hex")),
-    BigInt("0x" + destBytes.slice(24, 32).reverse().toString("hex")),
-  ];
-
-  const nonce = randomBytes(16);
-  const ciphertextRaw = cipher.encrypt(destValues, nonce);
-  const ciphertext = ciphertextRaw.map((chunk) => Uint8Array.from(chunk));
-
-  return { ciphertext, clientPublicKey, nonce };
-}
-
-// Encrypt claim_id (u64) and secret ([u64; 4]) for verify_and_claim circuit
-function encryptClaimData(
-  claimId: number,
-  secret: Buffer,
-  mxePublicKey: Uint8Array,
-  clientPrivateKey: Uint8Array
-): {
-  encryptedClaimId: Uint8Array;
-  encryptedSecret: Uint8Array[];
-  clientPublicKey: Uint8Array;
-  nonce: Buffer;
-} {
-  const clientPublicKey = x25519.getPublicKey(clientPrivateKey);
-  const sharedSecret = x25519.getSharedSecret(clientPrivateKey, mxePublicKey);
-  const cipher = new RescueCipher(sharedSecret);
-  const nonce = randomBytes(16);
-
-  const claimIdCiphertext = cipher.encrypt([BigInt(claimId)], nonce);
-  const encryptedClaimId = Uint8Array.from(claimIdCiphertext[0]);
-
-  const secretValues = [
-    BigInt("0x" + Buffer.from(secret.slice(0, 8)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(secret.slice(8, 16)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(secret.slice(16, 24)).reverse().toString("hex")),
-    BigInt("0x" + Buffer.from(secret.slice(24, 32)).reverse().toString("hex")),
-  ];
-  const secretCiphertext = cipher.encrypt(secretValues, nonce);
-  const encryptedSecret = secretCiphertext.map(chunk => Uint8Array.from(chunk));
-
-  return { encryptedClaimId, encryptedSecret, clientPublicKey, nonce };
+async function readProtocolState(connection: anchor.web3.Connection, powConfig: PublicKey): Promise<ProtocolState> {
+  const info = await connection.getAccountInfo(powConfig);
+  if (!info) throw new Error("PoW config not found");
+  const data = info.data;
+  const dLow = data.readBigUInt64LE(72);
+  const dHigh = data.readBigUInt64LE(80);
+  return {
+    difficulty: BigInt(dLow) | (BigInt(dHigh) << 64n),
+    blocksMined: data.readBigUInt64LE(96),
+    challenge: Buffer.from(data.slice(112, 144)),
+    challengeHex: Buffer.from(data.slice(112, 144)).toString("hex"),
+  };
 }
 
 // ============================================================================
@@ -1258,471 +376,695 @@ function encryptClaimData(
 // ============================================================================
 
 function killMiningProcess() {
-  if (currentMiningProcess) {
-    currentMiningProcess.kill('SIGTERM');
-    currentMiningProcess = null;
-  }
+  if (currentMiningProcess) { currentMiningProcess.kill("SIGTERM"); currentMiningProcess = null; }
 }
 
-async function mineWithGpu(
-  challenge: string,
-  minerPubkey: string,
-  blockNumber: number,
-  difficulty: number
-): Promise<{ nonce: number; hashrate: number; time_ms: number } | null> {
+function startGpuMiner(
+  challengeHex: string, minerPubkeyHex: string, blockNumber: bigint, difficulty: bigint,
+  onProgress?: (p: GpuProgress) => void,
+): { promise: Promise<GpuMineResult>; kill: () => void } {
+  const minerBinary = __dirname + "/../gpu-miner/target/release/miner";
+  if (!fs.existsSync(minerBinary)) {
+    return { promise: Promise.resolve({ status: "error", reason: "GPU binary not found" }), kill: () => {} };
+  }
+
+  const isWSL = fs.existsSync("/usr/lib/wsl/lib");
+  const env: Record<string, string> = { ...(process.env as Record<string, string>), RUST_LOG: "info" };
+  if (isWSL) env.LD_LIBRARY_PATH = "/usr/lib/wsl/lib";
+
+  const args = [
+    "--benchmark", "--backend", gpuBackend, "--device", String(gpuDevice),
+    "--difficulty", difficulty.toString(), "--challenge", challengeHex,
+    "--block-number", blockNumber.toString(), "--miner-pubkey", minerPubkeyHex,
+  ];
+  if (gpuBackend === "cuda") {
+    if (cudaThreadsPerBlock !== null) args.push("--cuda-threads-per-block", String(cudaThreadsPerBlock));
+    if (cudaNumBlocks !== null) args.push("--cuda-num-blocks", String(cudaNumBlocks));
+  }
+
+  const child = spawn(minerBinary, args, { env });
+  currentMiningProcess = child;
+  let killed = false;
+  let output = "";
+  let lineBuffer = "";
+
+  const parseLine = (line: string) => {
+    const m = line.match(/Progress:\s+(\d+)\s+hashes\s+\|\s+Live:\s+([\d.]+)\s+MH\/s\s+\|\s+Avg:\s+([\d.]+)\s+MH\/s/);
+    if (m) onProgress?.({ hashesChecked: BigInt(m[1]), liveHashrate: parseFloat(m[2]), avgHashrate: parseFloat(m[3]) });
+  };
+
+  const consume = (chunk: string) => {
+    output += chunk;
+    lineBuffer += chunk;
+    const lines = lineBuffer.split(/\r?\n/);
+    lineBuffer = lines.pop() ?? "";
+    for (const l of lines) parseLine(l);
+  };
+
+  child.stdout.on("data", (d: Buffer) => consume(d.toString()));
+  child.stderr.on("data", (d: Buffer) => consume(d.toString()));
+
+  const promise = new Promise<GpuMineResult>((resolve) => {
+    child.on("close", (code) => {
+      if (lineBuffer.trim()) parseLine(lineBuffer);
+      currentMiningProcess = null;
+      if (killed) { resolve({ status: "stopped" }); return; }
+      if (code !== 0) { resolve({ status: "error", reason: `Exit code ${code}`, output }); return; }
+      const nm = output.match(/Nonce found:\s+(\d+)/);
+      const tm = output.match(/Time:\s+([\d.]+)(\u00b5s|ms|s)/);
+      const hm = output.match(/Hashrate:\s+([\d.]+)\s+MH\/s/);
+      if (!nm || !tm || !hm) { resolve({ status: "error", reason: "Parse error", output }); return; }
+      const tv = parseFloat(tm[1]);
+      const u = tm[2];
+      const ms = u === "s" ? tv * 1000 : u === "ms" ? tv : tv / 1000;
+      resolve({ status: "success", nonce: BigInt(nm[1]), hashrate: parseFloat(hm[1]), timeMs: ms });
+    });
+    child.on("error", (e) => { currentMiningProcess = null; resolve({ status: "error", reason: e.message }); });
+  });
+
+  return {
+    promise,
+    kill: () => { if (!killed) { killed = true; child.kill("SIGTERM"); } },
+  };
+}
+
+function createChallengeMonitor(
+  connection: anchor.web3.Connection, powConfig: PublicKey,
+  baseline: ProtocolState, pollMs: number,
+): { changed: Promise<ProtocolState | null>; stop: () => void } {
+  let stopped = false, settled = false, inFlight = false;
+  let timer: NodeJS.Timeout | null = null;
+  let res: (v: ProtocolState | null) => void = () => {};
+
+  const settle = (v: ProtocolState | null) => {
+    if (settled) return;
+    settled = true;
+    if (timer) { clearInterval(timer); timer = null; }
+    res(v);
+  };
+
+  const changed = new Promise<ProtocolState | null>((r) => { res = r; });
+
+  const poll = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const fresh = await readProtocolState(connection, powConfig);
+      if (fresh.blocksMined !== baseline.blocksMined || fresh.challengeHex !== baseline.challengeHex) {
+        stopped = true;
+        settle(fresh);
+      }
+    } catch {} finally { inFlight = false; }
+  };
+
+  timer = setInterval(() => { void poll(); }, pollMs);
+  void poll();
+
+  return { changed, stop: () => { if (!stopped) { stopped = true; } settle(null); } };
+}
+
+async function waitForStateAdvance(
+  connection: anchor.web3.Connection, powConfig: PublicKey,
+  baseline: ProtocolState, timeoutMs: number,
+): Promise<ProtocolState | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const fresh = await readProtocolState(connection, powConfig);
+      if (fresh.blocksMined !== baseline.blocksMined || fresh.challengeHex !== baseline.challengeHex) return fresh;
+    } catch {}
+    await sleep(800);
+  }
+  return null;
+}
+
+// ============================================================================
+// ENCRYPTION HELPERS
+// ============================================================================
+
+function encryptAmount(amount: bigint, mxePk: Uint8Array, clientSk: Uint8Array, nonce: Buffer): Uint8Array {
+  const shared = x25519.getSharedSecret(clientSk, mxePk);
+  const cipher = new RescueCipher(shared);
+  return Uint8Array.from(cipher.encrypt([amount], nonce)[0]);
+}
+
+function encryptCurrentState(
+  balance: bigint, stateNonce: bigint, reserved: bigint,
+  mxePk: Uint8Array, clientSk: Uint8Array, nonce: Buffer,
+): Uint8Array[] {
+  const shared = x25519.getSharedSecret(clientSk, mxePk);
+  const cipher = new RescueCipher(shared);
+  return cipher.encrypt([balance, stateNonce, reserved], nonce).map((c: any) => Uint8Array.from(c));
+}
+
+function encryptCurrentTokenState(
+  tokenBalance: bigint, tokenNonce: bigint, tokenReserved: bigint,
+  mxePk: Uint8Array, clientSk: Uint8Array, nonce: Buffer,
+): Uint8Array[] {
+  return encryptCurrentState(tokenBalance, tokenNonce, tokenReserved, mxePk, clientSk, nonce);
+}
+
+function encryptDestination(
+  dest: PublicKey, mxePk: Uint8Array, clientSk: Uint8Array, nonce: Buffer,
+): Uint8Array[] {
+  const shared = x25519.getSharedSecret(clientSk, mxePk);
+  const cipher = new RescueCipher(shared);
+  const b = dest.toBuffer();
+  const vals = [
+    BigInt("0x" + Buffer.from(b.slice(0, 8)).reverse().toString("hex")),
+    BigInt("0x" + Buffer.from(b.slice(8, 16)).reverse().toString("hex")),
+    BigInt("0x" + Buffer.from(b.slice(16, 24)).reverse().toString("hex")),
+    BigInt("0x" + Buffer.from(b.slice(24, 32)).reverse().toString("hex")),
+  ];
+  return cipher.encrypt(vals, nonce).map((c: any) => Uint8Array.from(c));
+}
+
+// ============================================================================
+// MENU SYSTEM
+// ============================================================================
+
+async function promptUser(question: string): Promise<string> {
+  // Disable raw mode for readline prompt
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(false);
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
-    const args = [
-      '--benchmark',
-      '--backend', 'cuda',
-      '--difficulty', difficulty.toString(),
-      '--challenge', challenge,
-      '--block-number', blockNumber.toString(),
-      '--miner-pubkey', minerPubkey
-    ];
-
-    const minerBinary = __dirname + '/../gpu-miner/target/release/miner';
-    const isWSL = fs.existsSync('/usr/lib/wsl/lib');
-    const env: Record<string, string> = { ...process.env as Record<string, string>, RUST_LOG: 'info' };
-    if (isWSL) {
-      env.LD_LIBRARY_PATH = '/usr/lib/wsl/lib';
-    }
-
-    currentMiningProcess = spawn(minerBinary, args, { env });
-
-    let output = '';
-
-    currentMiningProcess.stdout?.on('data', (data) => {
-      output += data.toString();
-    });
-
-    currentMiningProcess.stderr?.on('data', (data) => {
-      output += data.toString();
-    });
-
-    currentMiningProcess.on('close', (code) => {
-      currentMiningProcess = null;
-
-      if (code !== 0) {
-        // Process was killed or failed
-        resolve(null);
-        return;
-      }
-
-      const nonceMatch = output.match(/Nonce found: (\d+)/);
-      const timeMatch = output.match(/Time: ([\d.]+)(ms|s)/);
-      const hashrateMatch = output.match(/Hashrate: ([\d.]+) MH\/s/);
-
-      if (!nonceMatch || !timeMatch || !hashrateMatch) {
-        console.log("Failed to parse miner output");
-        resolve(null);
-        return;
-      }
-
-      const time_ms = timeMatch[2] === 's'
-        ? parseFloat(timeMatch[1]) * 1000
-        : parseFloat(timeMatch[1]);
-
-      resolve({
-        nonce: parseInt(nonceMatch[1]),
-        hashrate: parseFloat(hashrateMatch[1]),
-        time_ms
-      });
-    });
-
-    currentMiningProcess.on('error', (error) => {
-      console.log(`GPU mining error: ${error.message}`);
-      currentMiningProcess = null;
-      resolve(null);
-    });
+    rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); });
   });
 }
 
-// ============================================================================
-// CLAIM PROCESSOR
-// ============================================================================
-
-// Process a single claim
-async function processSingleClaim(
-  provider: anchor.AnchorProvider,
-  program: Program,
-  connection: anchor.web3.Connection,
-  wallet: anchor.Wallet,
-  tokenProgramId: PublicKey,
-  privacyConfig: PublicKey,
-  privacyAuthority: PublicKey,
-  sharedTokenVault: PublicKey,
-  mxeAccount: PublicKey,
-  mempoolAccount: PublicKey,
-  executingPool: PublicKey,
-  clusterAccount: PublicKey,
-  signPdaAccount: PublicKey,
-  mxePublicKey: Uint8Array,
-  claim: {
-    claimId: number;
-    secret: Buffer;
-    destinationWallet: Keypair;
-    destinationPubkey?: string; // Added for user-defined destinations
-    clientPrivateKey: Uint8Array;
-    computationOffset: Buffer;
-    createdAt: number;
-  }
-) {
-  const [claimPda] = PublicKey.findProgramAddressSync(
-    [CLAIM_SEED, privacyConfig.toBuffer(), Buffer.from(new anchor.BN(claim.claimId).toArray('le', 8))],
-    POW_PRIVACY_ID
-  );
-
-  // Use destinationPubkey if available (from DB), otherwise use destinationWallet.publicKey
-  const destinationPubkey = claim.destinationPubkey
-    ? new PublicKey(claim.destinationPubkey)
-    : claim.destinationWallet.publicKey;
-
-  // Use the claim wallet (destinationWallet) as the signer for claim transactions
-  const claimSigner = claim.destinationWallet;
-
-  const destinationTokenAccount = await createAssociatedTokenAccountIdempotent(
-    connection,
-    claimSigner, // Use claim wallet to pay for ATA creation
-    MINT,
-    destinationPubkey,
-    {},
-    tokenProgramId
-  );
-
-  const verifyComputationOffset = new anchor.BN(randomBytes(8), "hex");
-
-  const verifyClaimOffset = Buffer.from(getCompDefAccOffset("verify_and_claim")).readUInt32LE();
-  const compDefAccount = getCompDefAccAddress(POW_PRIVACY_ID, verifyClaimOffset);
-  const computationAccount = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, verifyComputationOffset);
-
-  console.log(`   Claiming #${claim.claimId} via MPC...`);
-
-  const { encryptedClaimId, encryptedSecret, clientPublicKey: claimClientPubkey, nonce: claimNonce } = encryptClaimData(
-    claim.claimId,
-    claim.secret,
-    mxePublicKey,
-    claim.clientPrivateKey
-  );
-
-  const [claimRequestBufferPda] = PublicKey.findProgramAddressSync(
-    [CLAIM_REQUEST_BUFFER_SEED, claimSigner.publicKey.toBuffer(), Buffer.from(new anchor.BN(claim.claimId).toArray('le', 8))],
-    POW_PRIVACY_ID
-  );
-
-  console.log(`   TX1: Initializing claim request buffer...`);
-
-  const encryptedSecretArray = encryptedSecret.map(chunk => Array.from(chunk));
-
-  const initBufferTx = await program.methods
-    .initClaimRequestBuffer(
-      new anchor.BN(claim.claimId),
-      Array.from(claimClientPubkey),
-      new anchor.BN(deserializeLE(claimNonce).toString()),
-      Array.from(claim.secret),
-      Array.from(encryptedClaimId),
-      encryptedSecretArray
-    )
-    .accounts({
-      payer: claimSigner.publicKey,
-      privacyConfig: privacyConfig,
-      claimRequestBuffer: claimRequestBufferPda,
-      systemProgram: SystemProgram.programId,
-    })
-    .signers([claimSigner])
-    .rpc({ skipPreflight: true });
-
-  console.log(`   TX1 confirmed: ${initBufferTx.slice(0, 20)}...`);
-
-  console.log(`   TX2: Executing claim_reward...`);
-
-  const [extraAccountMetaList] = PublicKey.findProgramAddressSync(
-    [HOOK_EXTRA_ACCOUNT_METAS_SEED, MINT.toBuffer()],
-    TRANSFER_HOOK_PROGRAM_ID
-  );
-  const [hookFeeVault] = PublicKey.findProgramAddressSync(
-    [HOOK_FEE_VAULT_SEED, MINT.toBuffer()],
-    TRANSFER_HOOK_PROGRAM_ID
-  );
-  const [powConfig] = PublicKey.findProgramAddressSync(
-    [POW_CONFIG_SEED],
-    POW_PROTOCOL_ID
-  );
-
-  const tx = await program.methods
-    .claimReward(verifyComputationOffset)
-    .accounts({
-      claimer: claimSigner.publicKey,
-      privacyConfig: privacyConfig,
-      privacyAuthority: privacyAuthority,
-      claimRequestBuffer: claimRequestBufferPda,
-      claim: claimPda,
-      mint: MINT,
-      sharedTokenVault: sharedTokenVault,
-      destinationTokenAccount: destinationTokenAccount,
-      tokenProgram: tokenProgramId,
-      systemProgram: SystemProgram.programId,
-      transferHookProgram: TRANSFER_HOOK_PROGRAM_ID,
-      extraAccountMetaList: extraAccountMetaList,
-      hookFeeVault: hookFeeVault,
-      powConfig: powConfig,
-      powProgram: POW_PROTOCOL_ID,
-      signPdaAccount: signPdaAccount,
-      mxeAccount: mxeAccount,
-      mempoolAccount: mempoolAccount,
-      executingPool: executingPool,
-      computationAccount: computationAccount,
-      compDefAccount: compDefAccount,
-      clusterAccount: clusterAccount,
-      poolAccount: ARCIUM_FEE_POOL,
-      clockAccount: ARCIUM_CLOCK,
-      arciumProgram: ARCIUM_PROGRAM_ID,
-    })
-    .signers([claimSigner])
-    .rpc({ skipPreflight: true });
-
-  console.log(`   Claim #${claim.claimId} queued for MPC: ${tx.slice(0, 20)}...`);
-
-  console.log(`   Waiting for MPC verification...`);
-  try {
-    const finalizeSig = await awaitComputationFinalization(
-      provider,
-      verifyComputationOffset,
-      POW_PRIVACY_ID,
-      "confirmed"
-    );
-    console.log(`   MPC finalized: ${finalizeSig.slice(0, 20)}...`);
-    console.log(`   Claimed #${claim.claimId} -> ${destinationPubkey.toString().slice(0, 8)}...`);
-  } catch (mpcErr: any) {
-    console.log(`   MPC finalization timeout, claim may still complete`);
-  }
-
-  // Mark as claimed in database
-  claimsDb.markClaimClaimed(claim.claimId, tx);
-
-  // Remove from in-memory array if present
-  const memIdx = pendingClaims.findIndex(p => p.claimId === claim.claimId);
-  if (memIdx >= 0) pendingClaims.splice(memIdx, 1);
-
-  // Save wallet to file for backup
-  const walletsDir = __dirname + "/../wallets-privacy";
-  if (!fs.existsSync(walletsDir)) fs.mkdirSync(walletsDir);
-  fs.writeFileSync(
-    `${walletsDir}/claim-${claim.claimId}.json`,
-    JSON.stringify(Array.from(claim.destinationWallet.secretKey))
-  );
-
-  console.log(`   ✓ Claim #${claim.claimId} marked as claimed in database`);
+function printMainMenu() {
+  console.log("\n");
+  console.log("\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557");
+  console.log("\u2551                    PRIVACY MINER MENU                      \u2551");
+  console.log("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563");
+  console.log("\u2551  [1] Miners & Funds  - Miner wallet, deposit/withdraw      \u2551");
+  console.log("\u2551  [2] Relayers        - Add/remove/list relayer wallets      \u2551");
+  console.log("\u2551  [3] Claimers        - Withdraw HASHISH to destinations     \u2551");
+  console.log("\u2551  [S] Stop            - Stop mining and exit                 \u2551");
+  console.log("\u2551  [M] Close Menu      - Return to mining                     \u2551");
+  console.log("\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D");
+  console.log("");
 }
 
-// Process multiple pending claims
-async function processPendingClaims(
-  provider: anchor.AnchorProvider,
-  program: Program,
-  connection: anchor.web3.Connection,
-  wallet: anchor.Wallet,
-  tokenProgramId: PublicKey,
-  privacyConfig: PublicKey,
-  privacyAuthority: PublicKey,
-  sharedTokenVault: PublicKey,
-  mxeAccount: PublicKey,
-  mempoolAccount: PublicKey,
-  executingPool: PublicKey,
-  clusterAccount: PublicKey,
-  signPdaAccount: PublicKey,
-  mxePublicKey: Uint8Array
-) {
-  // Get claims ready to process from database (older than 30s, not yet claimed)
-  const dbClaimsReady = claimsDb.getClaimsReadyToProcess(30);
+// ── MINERS & FUNDS ──
 
-  if (dbClaimsReady.length === 0 && pendingClaims.length === 0) return;
-
-  console.log(`\n Processing claims: ${dbClaimsReady.length} from DB, ${pendingClaims.length} in memory...`);
-
-  // Process claims from database
-  for (const dbClaim of dbClaimsReady) {
-    // Convert database record to claim format
-    const claim = claimsDb.claimRecordToPendingClaim(dbClaim);
-
-    // Use destinationPubkey if available (from DB), otherwise use destinationWallet.publicKey
-    const destinationPubkey = claim.destinationPubkey
-      ? new PublicKey(claim.destinationPubkey)
-      : claim.destinationWallet.publicKey;
-
-    // Use the claim wallet (destinationWallet) as the signer for claim transactions
-    const claimSigner = claim.destinationWallet;
-
+async function handleMinersMenu(ctx: MiningContext) {
+  while (true) {
+    const state = db.loadMinerState();
+    console.log("\n--- MINERS & FUNDS ---");
+    console.log(`  Miner wallet: ${minerWalletPath}`);
     try {
-      const [claimPda] = PublicKey.findProgramAddressSync(
-        [CLAIM_SEED, privacyConfig.toBuffer(), Buffer.from(new anchor.BN(claim.claimId).toArray('le', 8))],
-        POW_PRIVACY_ID
-      );
+      const kp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8"))));
+      const bal = await ctx.connection.getBalance(kp.publicKey);
+      console.log(`  Address: ${kp.publicKey.toString()}`);
+      console.log(`  SOL balance (on-chain): ${(bal / 1e9).toFixed(6)} SOL`);
+    } catch { console.log("  (Unable to load)"); }
+    console.log(`  Encrypted SOL balance: ${state.balance.toString()} lamports`);
+    console.log(`  Encrypted HASHISH balance: ${state.tokenBalance.toString()} tokens`);
+    console.log("\n  [1] Change miner wallet");
+    console.log("  [D] Deposit SOL");
+    console.log("  [W] Withdraw SOL");
+    console.log("  [B] Back");
 
-      const destinationTokenAccount = await createAssociatedTokenAccountIdempotent(
-        connection,
-        claimSigner, // Use claim wallet to pay for ATA creation
-        MINT,
-        destinationPubkey,
-        {},
-        tokenProgramId
-      );
+    const choice = (await promptUser("  > ")).toUpperCase();
+    if (choice === "B" || choice === "") break;
+    if (choice === "1") await handleChangeMiner();
+    else if (choice === "D") await handleDepositSol(ctx);
+    else if (choice === "W") await handleWithdrawSol(ctx);
+    else console.log("  Invalid choice.");
+  }
+}
 
-      const verifyComputationOffset = new anchor.BN(randomBytes(8), "hex");
+async function handleChangeMiner() {
+  const newPath = await promptUser("  Enter new miner wallet path (empty to cancel): ");
+  if (!newPath) return;
+  if (!fs.existsSync(newPath)) { console.log("  File not found."); return; }
+  try {
+    const kp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(newPath, "utf-8"))));
+    minerWalletPath = newPath;
+    db.setMinerWalletPath(newPath);
+    console.log(`  Miner changed to: ${kp.publicKey.toString()}`);
+    console.log("  RESTART the miner for the change to take full effect.");
+  } catch { console.log("  Invalid keypair file."); }
+}
 
-      const verifyClaimOffset = Buffer.from(getCompDefAccOffset("verify_and_claim")).readUInt32LE();
-      const compDefAccount = getCompDefAccAddress(POW_PRIVACY_ID, verifyClaimOffset);
-      const computationAccount = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, verifyComputationOffset);
+async function handleDepositSol(ctx: MiningContext) {
+  const amtStr = await promptUser("  Amount in SOL: ");
+  const sol = parseFloat(amtStr);
+  if (isNaN(sol) || sol <= 0) { console.log("  Invalid amount."); return; }
+  const lamports = Math.floor(sol * 1e9);
 
-      console.log(`   Claiming #${claim.claimId} via MPC...`);
+  try {
+    const minerKp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8"))));
+    const minerWallet = new anchor.Wallet(minerKp);
+    const minerProvider = new anchor.AnchorProvider(ctx.connection, minerWallet, { commitment: "confirmed" });
+    const program = new Program(ctx.privacyIdl, minerProvider);
 
-      const { encryptedClaimId, encryptedSecret, clientPublicKey: claimClientPubkey, nonce: claimNonce } = encryptClaimData(
-        claim.claimId,
-        claim.secret,
-        mxePublicKey,
-        claim.clientPrivateKey
-      );
+    const clientSk = x25519.utils.randomSecretKey();
+    const clientPk = x25519.getPublicKey(clientSk);
+    const nonce = randomBytes(16);
+    const state = db.loadMinerState();
 
-      const [claimRequestBufferPda] = PublicKey.findProgramAddressSync(
-        [CLAIM_REQUEST_BUFFER_SEED, claimSigner.publicKey.toBuffer(), Buffer.from(new anchor.BN(claim.claimId).toArray('le', 8))],
-        POW_PRIVACY_ID
-      );
+    const encAmt = encryptAmount(BigInt(lamports), ctx.mxePublicKey, clientSk, nonce);
+    const encState = encryptCurrentState(state.balance, state.stateNonce, state.reserved, ctx.mxePublicKey, clientSk, nonce);
 
-      console.log(`   TX1: Initializing claim request buffer...`);
+    const [bufferPda] = PublicKey.findProgramAddressSync(
+      [DEPOSIT_BUFFER_SEED, minerWallet.publicKey.toBuffer(), encAmt.slice(0, 8)], POW_PRIVACY_ID,
+    );
 
-      const encryptedSecretArray = encryptedSecret.map(chunk => Array.from(chunk));
+    console.log("  Creating deposit buffer...");
+    await program.methods
+      .createDepositBuffer(Array.from(encAmt), encState.map((c) => Array.from(c)),
+        Array.from(clientPk), new anchor.BN(deserializeLE(nonce).toString()), new anchor.BN(lamports))
+      .accounts({ depositor: minerWallet.publicKey, privacyConfig: ctx.privacyConfig, depositBuffer: bufferPda, systemProgram: SystemProgram.programId })
+      .rpc();
 
-      const initBufferTx = await program.methods
-        .initClaimRequestBuffer(
-          new anchor.BN(claim.claimId),
-          Array.from(claimClientPubkey),
-          new anchor.BN(deserializeLE(claimNonce).toString()),
-          Array.from(claim.secret),
-          Array.from(encryptedClaimId),
-          encryptedSecretArray
-        )
-        .accounts({
-          payer: claimSigner.publicKey,
-          privacyConfig: privacyConfig,
-          claimRequestBuffer: claimRequestBufferPda,
-          systemProgram: SystemProgram.programId,
-        })
-        .signers([claimSigner])
-        .rpc({ skipPreflight: true });
+    console.log("  Executing deposit via MPC...");
+    const compOffset = new anchor.BN(randomBytes(8), "hex");
+    const defOffset = Buffer.from(getCompDefAccOffset("deposit_fee")).readUInt32LE();
+    const compDef = getCompDefAccAddress(POW_PRIVACY_ID, defOffset);
+    const compAcc = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, compOffset);
 
-      console.log(`   TX1 confirmed: ${initBufferTx.slice(0, 20)}...`);
+    await program.methods.depositPrivate(compOffset)
+      .accounts({
+        depositor: minerWallet.publicKey, privacyConfig: ctx.privacyConfig, depositBuffer: bufferPda,
+        owner: minerWallet.publicKey, sharedFeeVault: ctx.sharedFeeVault, systemProgram: SystemProgram.programId,
+        signPdaAccount: ctx.signPdaAccount, mxeAccount: ctx.mxeAccount, mempoolAccount: ctx.mempoolAccount,
+        executingPool: ctx.executingPool, computationAccount: compAcc, compDefAccount: compDef,
+        clusterAccount: ctx.clusterAccount, poolAccount: ARCIUM_FEE_POOL, clockAccount: ARCIUM_CLOCK,
+        arciumProgram: ARCIUM_PROGRAM_ID,
+      })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 })])
+      .rpc({ skipPreflight: true });
 
-      console.log(`   TX2: Executing claim_reward...`);
+    console.log("  Waiting for MPC...");
+    try {
+      await awaitComputationFinalization(minerProvider, compOffset, POW_PRIVACY_ID, "confirmed");
+      // Update local state
+      const s = db.loadMinerState();
+      s.balance += BigInt(lamports);
+      s.stateNonce += 1n;
+      db.saveMinerState(s);
+      console.log(`  Deposit successful! ${sol} SOL added.`);
+    } catch { console.log("  MPC timeout - may complete in background."); }
+  } catch (e: any) { console.error("  Deposit failed:", e?.message || e); }
+}
 
-      const [extraAccountMetaList] = PublicKey.findProgramAddressSync(
-        [HOOK_EXTRA_ACCOUNT_METAS_SEED, MINT.toBuffer()],
-        TRANSFER_HOOK_PROGRAM_ID
-      );
-      const [hookFeeVault] = PublicKey.findProgramAddressSync(
-        [HOOK_FEE_VAULT_SEED, MINT.toBuffer()],
-        TRANSFER_HOOK_PROGRAM_ID
-      );
-      const [powConfig] = PublicKey.findProgramAddressSync(
-        [POW_CONFIG_SEED],
-        POW_PROTOCOL_ID
-      );
+async function handleWithdrawSol(ctx: MiningContext) {
+  const amtStr = await promptUser("  Amount in SOL: ");
+  const sol = parseFloat(amtStr);
+  if (isNaN(sol) || sol <= 0) { console.log("  Invalid amount."); return; }
+  const lamports = Math.floor(sol * 1e9);
 
-      const tx = await program.methods
-        .claimReward(verifyComputationOffset)
-        .accounts({
-          claimer: claimSigner.publicKey,
-          privacyConfig: privacyConfig,
-          privacyAuthority: privacyAuthority,
-          claimRequestBuffer: claimRequestBufferPda,
-          claim: claimPda,
-          mint: MINT,
-          sharedTokenVault: sharedTokenVault,
-          destinationTokenAccount: destinationTokenAccount,
-          tokenProgram: tokenProgramId,
-          systemProgram: SystemProgram.programId,
-          transferHookProgram: TRANSFER_HOOK_PROGRAM_ID,
-          extraAccountMetaList: extraAccountMetaList,
-          hookFeeVault: hookFeeVault,
-          powConfig: powConfig,
-          powProgram: POW_PROTOCOL_ID,
-          signPdaAccount: signPdaAccount,
-          mxeAccount: mxeAccount,
-          mempoolAccount: mempoolAccount,
-          executingPool: executingPool,
-          computationAccount: computationAccount,
-          compDefAccount: compDefAccount,
-          clusterAccount: clusterAccount,
-          poolAccount: ARCIUM_FEE_POOL,
-          clockAccount: ARCIUM_CLOCK,
-          arciumProgram: ARCIUM_PROGRAM_ID,
-        })
-        .signers([claimSigner])
-        .rpc({ skipPreflight: true });
+  let destStr = await promptUser("  Destination address (empty for new random): ");
+  let destination: PublicKey;
+  if (!destStr) {
+    const kp = Keypair.generate();
+    destination = kp.publicKey;
+    const dir = __dirname + "/../wallets-privacy";
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+    fs.writeFileSync(`${dir}/withdraw-${Date.now()}.json`, JSON.stringify(Array.from(kp.secretKey)));
+    console.log(`  New wallet saved: ${destination.toString()}`);
+  } else {
+    try { destination = new PublicKey(destStr); } catch { console.log("  Invalid address."); return; }
+  }
 
-      console.log(`   Claim #${claim.claimId} queued for MPC: ${tx.slice(0, 20)}...`);
+  try {
+    const minerKp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8"))));
+    const minerWallet = new anchor.Wallet(minerKp);
+    const minerProvider = new anchor.AnchorProvider(ctx.connection, minerWallet, { commitment: "confirmed" });
+    const program = new Program(ctx.privacyIdl, minerProvider);
 
-      console.log(`   Waiting for MPC verification...`);
-      try {
-        const finalizeSig = await awaitComputationFinalization(
-          provider,
-          verifyComputationOffset,
-          POW_PRIVACY_ID,
-          "confirmed"
-        );
-        console.log(`   MPC finalized: ${finalizeSig.slice(0, 20)}...`);
-        console.log(`   Claimed #${claim.claimId} -> ${destinationPubkey.toString().slice(0, 8)}...`);
-      } catch (mpcErr: any) {
-        console.log(`   MPC finalization timeout, claim may still complete`);
+    const clientSk = x25519.utils.randomSecretKey();
+    const clientPk = x25519.getPublicKey(clientSk);
+    const nonce = randomBytes(16);
+    const state = db.loadMinerState();
+
+    const encAmt = encryptAmount(BigInt(lamports), ctx.mxePublicKey, clientSk, nonce);
+    const encDest = encryptDestination(destination, ctx.mxePublicKey, clientSk, nonce);
+    const encState = encryptCurrentState(state.balance, state.stateNonce, state.reserved, ctx.mxePublicKey, clientSk, nonce);
+
+    const [bufferPda] = PublicKey.findProgramAddressSync(
+      [WITHDRAW_BUFFER_SEED, minerWallet.publicKey.toBuffer(), encAmt.slice(0, 8)], POW_PRIVACY_ID,
+    );
+
+    console.log("  Creating withdraw buffer...");
+    await program.methods
+      .createWithdrawBuffer(
+        Array.from(encAmt), encDest.map((c) => Array.from(c)), encState.map((c) => Array.from(c)),
+        Array.from(clientPk), new anchor.BN(deserializeLE(nonce).toString()), new anchor.BN(lamports),
+      )
+      .accounts({ creator: minerWallet.publicKey, privacyConfig: ctx.privacyConfig, withdrawBuffer: bufferPda, systemProgram: SystemProgram.programId })
+      .rpc();
+
+    // Get team_wallet from privacyConfig
+    const privacyProgram = new Program(ctx.privacyIdl, minerProvider);
+    const configAccount = await (privacyProgram.account as any).privacyConfig.fetch(ctx.privacyConfig);
+    const teamWallet = configAccount.teamWallet as PublicKey;
+
+    console.log("  Executing withdrawal via MPC...");
+    const compOffset = new anchor.BN(randomBytes(8), "hex");
+    const defOffset = Buffer.from(getCompDefAccOffset("withdraw_fee")).readUInt32LE();
+    const compDef = getCompDefAccAddress(POW_PRIVACY_ID, defOffset);
+    const compAcc = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, compOffset);
+
+    await program.methods.withdrawPrivate(compOffset)
+      .accounts({
+        caller: minerWallet.publicKey, privacyConfig: ctx.privacyConfig, withdrawBuffer: bufferPda,
+        sharedFeeVault: ctx.sharedFeeVault, destination, teamWallet,
+        systemProgram: SystemProgram.programId, signPdaAccount: ctx.signPdaAccount,
+        mxeAccount: ctx.mxeAccount, mempoolAccount: ctx.mempoolAccount,
+        executingPool: ctx.executingPool, computationAccount: compAcc, compDefAccount: compDef,
+        clusterAccount: ctx.clusterAccount, poolAccount: ARCIUM_FEE_POOL, clockAccount: ARCIUM_CLOCK,
+        arciumProgram: ARCIUM_PROGRAM_ID,
+      })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 })])
+      .rpc({ skipPreflight: true });
+
+    console.log("  Waiting for MPC...");
+    try {
+      await awaitComputationFinalization(minerProvider, compOffset, POW_PRIVACY_ID, "confirmed");
+      const s = db.loadMinerState();
+      s.balance -= BigInt(lamports);
+      s.stateNonce += 1n;
+      db.saveMinerState(s);
+      console.log(`  Withdrawal successful! ${sol} SOL to ${destination.toString()}`);
+    } catch { console.log("  MPC timeout - may complete in background."); }
+  } catch (e: any) { console.error("  Withdrawal failed:", e?.message || e); }
+}
+
+// ── RELAYERS ──
+
+async function handleRelayersMenu(ctx: MiningContext) {
+  while (true) {
+    const relayers = db.getAllRelayers();
+    console.log("\n--- RELAYERS ---");
+    if (relayers.length === 0) {
+      console.log("  No relayers configured. Add one to start mining.");
+    } else {
+      for (const r of relayers) {
+        try {
+          const bal = await ctx.connection.getBalance(new PublicKey(r.pubkey));
+          console.log(`  [${r.id}] ${r.name} | ${formatShort(r.pubkey)} | ${(bal / 1e9).toFixed(4)} SOL | ${r.is_active ? "active" : "inactive"}`);
+        } catch {
+          console.log(`  [${r.id}] ${r.name} | ${formatShort(r.pubkey)} | ? SOL | ${r.is_active ? "active" : "inactive"}`);
+        }
       }
+    }
+    console.log("\n  [A] Add relayer");
+    console.log("  [R] Remove relayer");
+    console.log("  [B] Back");
 
-      // Mark as claimed in database
-      claimsDb.markClaimClaimed(claim.claimId, tx);
+    const choice = (await promptUser("  > ")).toUpperCase();
+    if (choice === "B" || choice === "") break;
+    if (choice === "A") {
+      const name = await promptUser("  Name: ");
+      if (!name) continue;
+      const path = await promptUser("  Wallet path: ");
+      if (!path || !fs.existsSync(path)) { console.log("  File not found."); continue; }
+      const r = db.addRelayer(name, path);
+      if (r) console.log(`  Added: ${r.name} (${r.pubkey})`);
+      else console.log("  Failed to add (invalid keypair?).");
+    } else if (choice === "R") {
+      const idStr = await promptUser("  Relayer ID to remove: ");
+      const id = parseInt(idStr, 10);
+      if (isNaN(id)) continue;
+      if (db.removeRelayer(id)) console.log("  Removed.");
+      else console.log("  Not found.");
+    }
+  }
+}
 
-      // Remove from in-memory array if present
-      const memIdx = pendingClaims.findIndex(p => p.claimId === claim.claimId);
-      if (memIdx >= 0) pendingClaims.splice(memIdx, 1);
+// ── CLAIMERS ──
 
-      // Save wallet to file for backup
-      const walletsDir = __dirname + "/../wallets-privacy";
-      if (!fs.existsSync(walletsDir)) fs.mkdirSync(walletsDir);
-      fs.writeFileSync(
-        `${walletsDir}/claim-${claim.claimId}.json`,
-        JSON.stringify(Array.from(claim.destinationWallet.secretKey))
-      );
+async function handleClaimersMenu(ctx: MiningContext) {
+  while (true) {
+    const claimers = db.getAllClaimers();
+    const state = db.loadMinerState();
+    // Read mint decimals for human-readable display
+    let decimals = 9;
+    try {
+      const mi = await ctx.connection.getAccountInfo(MINT);
+      if (mi) decimals = mi.data[44];
+    } catch {}
+    const encBalHuman = (Number(state.tokenBalance) / Math.pow(10, decimals)).toFixed(decimals);
+    console.log("\n--- CLAIMERS (HASHISH Withdraw) ---");
+    console.log(`  Encrypted HASHISH balance: ${encBalHuman} HASHISH (raw: ${state.tokenBalance.toString()})`);
 
-      console.log(`   ✓ Claim #${claim.claimId} marked as claimed in database`);
-
-    } catch (err: any) {
-      const msg = err?.message ?? err?.toString?.() ?? JSON.stringify(err);
-      console.log(`   Failed to claim #${claim.claimId}: ${msg}`);
-      if (err?.logs) {
-        err.logs.slice(-10).forEach((log: string) => console.log(`      ${log}`));
+    if (claimers.length === 0) {
+      console.log("  No claimers configured.");
+    } else {
+      for (const c of claimers) {
+        try {
+          const ata = getAssociatedTokenAddressSync(MINT, new PublicKey(c.pubkey), false, ctx.tokenProgramId);
+          const ataInfo = await ctx.connection.getTokenAccountBalance(ata);
+          const bal = ataInfo.value.uiAmountString ?? "0";
+          console.log(`  [${c.id}] ${c.name} | ${formatShort(c.pubkey)} | ${bal} HASHISH (on-chain)`);
+        } catch {
+          console.log(`  [${c.id}] ${c.name} | ${formatShort(c.pubkey)} | 0 HASHISH (on-chain)`);
+        }
       }
-      // Mark as failed in database (will be retried if retry_count < 5)
-      claimsDb.markClaimFailed(claim.claimId, msg);
+    }
+
+    console.log("\n  [A] Add claimer");
+    console.log("  [R] Remove claimer");
+    console.log("  [W] Withdraw HASHISH to claimer");
+    console.log("  [B] Back");
+
+    const choice = (await promptUser("  > ")).toUpperCase();
+    if (choice === "B" || choice === "") break;
+    if (choice === "A") {
+      const name = await promptUser("  Name: ");
+      if (!name) continue;
+      const pubkeyStr = await promptUser("  Pubkey (or wallet path): ");
+      if (!pubkeyStr) continue;
+      let pubkey: string;
+      let walletPath: string | undefined;
+      if (fs.existsSync(pubkeyStr)) {
+        try {
+          const kp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(pubkeyStr, "utf-8"))));
+          pubkey = kp.publicKey.toString();
+          walletPath = pubkeyStr;
+        } catch { console.log("  Invalid keypair."); continue; }
+      } else {
+        try { new PublicKey(pubkeyStr); pubkey = pubkeyStr; } catch { console.log("  Invalid pubkey."); continue; }
+      }
+      const c = db.addClaimer(name, pubkey, walletPath);
+      if (c) console.log(`  Added: ${c.name} (${c.pubkey})`);
+      else console.log("  Failed to add.");
+    } else if (choice === "R") {
+      const idStr = await promptUser("  Claimer ID to remove: ");
+      const id = parseInt(idStr, 10);
+      if (isNaN(id)) continue;
+      if (db.removeClaimer(id)) console.log("  Removed.");
+      else console.log("  Not found.");
+    } else if (choice === "W") {
+      await handleWithdrawHashish(ctx);
+    }
+  }
+}
+
+async function handleWithdrawHashish(ctx: MiningContext) {
+  const claimers = db.getActiveClaimers();
+  if (claimers.length === 0) { console.log("  No active claimers."); return; }
+
+  console.log("\n  Select destination claimer:");
+  for (const c of claimers) console.log(`    [${c.id}] ${c.name} | ${formatShort(c.pubkey)}`);
+
+  const idStr = await promptUser("  Claimer ID: ");
+  const id = parseInt(idStr, 10);
+  const claimer = claimers.find((c) => c.id === id);
+  if (!claimer) { console.log("  Invalid ID."); return; }
+
+  const amtStr = await promptUser("  Amount of HASHISH tokens: ");
+  const amount = parseFloat(amtStr);
+  if (isNaN(amount) || amount <= 0) { console.log("  Invalid amount."); return; }
+
+  // Token amounts - assume 9 decimals like SOL
+  const mintInfo = await ctx.connection.getAccountInfo(MINT);
+  if (!mintInfo) { console.log("  Mint not found."); return; }
+  // Read decimals from mint account (offset 44 for Token-2022)
+  const decimals = mintInfo.data[44];
+  const rawAmount = Math.floor(amount * Math.pow(10, decimals));
+  const destination = new PublicKey(claimer.pubkey);
+
+  try {
+    const minerKp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8"))));
+    const minerWallet = new anchor.Wallet(minerKp);
+    const minerProvider = new anchor.AnchorProvider(ctx.connection, minerWallet, { commitment: "confirmed" });
+    const program = new Program(ctx.privacyIdl, minerProvider);
+
+    const clientSk = x25519.utils.randomSecretKey();
+    const clientPk = x25519.getPublicKey(clientSk);
+    const nonce = randomBytes(16);
+    const state = db.loadMinerState();
+
+    const encAmt = encryptAmount(BigInt(rawAmount), ctx.mxePublicKey, clientSk, nonce);
+    const encDest = encryptDestination(destination, ctx.mxePublicKey, clientSk, nonce);
+    const encState = encryptCurrentTokenState(state.tokenBalance, state.tokenNonce, state.tokenReserved, ctx.mxePublicKey, clientSk, nonce);
+
+    const [bufferPda] = PublicKey.findProgramAddressSync(
+      [WITHDRAW_TOKEN_BUFFER_SEED, minerWallet.publicKey.toBuffer(), encAmt.slice(0, 8)], POW_PRIVACY_ID,
+    );
+
+    // Ensure destination token account exists
+    const destTokenAcc = await createAssociatedTokenAccountIdempotent(
+      ctx.connection, minerKp, MINT, destination, {}, ctx.tokenProgramId,
+    );
+
+    // Get team_token_account from privacyConfig
+    const configData = await ctx.connection.getAccountInfo(ctx.privacyConfig);
+    if (!configData) throw new Error("Privacy config not found");
+    // team_token_account is stored in PrivacyConfig - read from IDL
+    const privacyProgram = new Program(ctx.privacyIdl, minerProvider);
+    const configAccount = await (privacyProgram.account as any).privacyConfig.fetch(ctx.privacyConfig);
+    const teamTokenAccount = configAccount.teamTokenAccount as PublicKey;
+
+    console.log("  Creating withdraw token buffer...");
+    await program.methods
+      .createWithdrawTokenBuffer(
+        Array.from(encAmt), encDest.map((c) => Array.from(c)), encState.map((c) => Array.from(c)),
+        Array.from(clientPk), new anchor.BN(deserializeLE(nonce).toString()), new anchor.BN(rawAmount),
+      )
+      .accounts({ creator: minerWallet.publicKey, privacyConfig: ctx.privacyConfig, withdrawTokenBuffer: bufferPda, systemProgram: SystemProgram.programId })
+      .rpc();
+
+    console.log("  Executing withdrawal via MPC...");
+    const compOffset = new anchor.BN(randomBytes(8), "hex");
+    const defOffset = Buffer.from(getCompDefAccOffset("withdraw_token")).readUInt32LE();
+    const compDef = getCompDefAccAddress(POW_PRIVACY_ID, defOffset);
+    const compAcc = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, compOffset);
+
+    await program.methods.withdrawTokenPrivate(compOffset)
+      .accounts({
+        caller: minerWallet.publicKey, privacyConfig: ctx.privacyConfig, withdrawTokenBuffer: bufferPda,
+        systemProgram: SystemProgram.programId,
+        signPdaAccount: ctx.signPdaAccount,
+        mxeAccount: ctx.mxeAccount, mempoolAccount: ctx.mempoolAccount,
+        executingPool: ctx.executingPool, computationAccount: compAcc, compDefAccount: compDef,
+        clusterAccount: ctx.clusterAccount, poolAccount: ARCIUM_FEE_POOL, clockAccount: ARCIUM_CLOCK,
+        arciumProgram: ARCIUM_PROGRAM_ID,
+      })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 })])
+      .rpc({ skipPreflight: true });
+
+    console.log("  Waiting for MPC callback...");
+    try {
+      await awaitComputationFinalization(minerProvider, compOffset, POW_PRIVACY_ID, "confirmed");
+    } catch { console.log("  MPC timeout - may complete in background."); return; }
+
+    // Step 3: Execute the token transfer after MPC approval
+    console.log("  Executing token transfer...");
+
+    // Derive transfer hook accounts
+    const [hookExtraAccountMetas] = PublicKey.findProgramAddressSync(
+      [Buffer.from("extra-account-metas"), MINT.toBuffer()], TRANSFER_HOOK_PROGRAM_ID,
+    );
+    const [hookFeeVault] = PublicKey.findProgramAddressSync(
+      [Buffer.from("fee_vault"), MINT.toBuffer()], TRANSFER_HOOK_PROGRAM_ID,
+    );
+    const [hookPowConfig] = PublicKey.findProgramAddressSync(
+      [Buffer.from("pow_config")], TRANSFER_HOOK_PROGRAM_ID,
+    );
+
+    await program.methods.executeWithdrawToken()
+      .accounts({
+        caller: minerWallet.publicKey, privacyConfig: ctx.privacyConfig, withdrawTokenBuffer: bufferPda,
+        privacyAuthority: ctx.privacyAuthority, mint: MINT, sharedTokenVault: ctx.sharedTokenVault,
+        destinationTokenAccount: destTokenAcc, teamTokenAccount,
+        tokenProgram: ctx.tokenProgramId,
+        transferHookProgram: TRANSFER_HOOK_PROGRAM_ID,
+        extraAccountMetaList: hookExtraAccountMetas,
+        hookFeeVault,
+        hookPowConfig,
+        powProtocolProgram: POW_PROTOCOL_ID,
+      })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 })])
+      .rpc({ skipPreflight: true });
+
+    const s = db.loadMinerState();
+    s.tokenBalance -= BigInt(rawAmount);
+    s.tokenNonce += 1n;
+    db.saveMinerState(s);
+    console.log(`  Withdrawal successful! ${amount} HASHISH to ${claimer.name} (${formatShort(claimer.pubkey)})`);
+  } catch (e: any) { console.error("  Withdrawal failed:", e?.message || e); }
+}
+
+// ── MAIN MENU ──
+
+async function handleMenu(ctx: MiningContext) {
+  menuActive = true;
+  killMiningProcess();
+
+  // Restore cursor and clear screen for menu
+  if (renderer.cursorHidden) {
+    process.stdout.write("\x1b[?25h");
+    renderer.cursorHidden = false;
+  }
+  renderer.active = false;
+  renderer.previousLines = [];
+  // Clear terminal for clean menu display
+  process.stdout.write("\x1b[2J\x1b[H");
+
+  printMainMenu();
+
+  while (menuActive) {
+    const choice = (await promptUser("Menu > ")).toUpperCase();
+    switch (choice) {
+      case "1": await handleMinersMenu(ctx); printMainMenu(); break;
+      case "2": await handleRelayersMenu(ctx); printMainMenu(); break;
+      case "3": await handleClaimersMenu(ctx); printMainMenu(); break;
+      case "S":
+        console.log("\nStopping miner...");
+        isMining = false;
+        menuActive = false;
+        break;
+      case "M": case "":
+        menuActive = false;
+        // Clear screen for dashboard
+        process.stdout.write("\x1b[2J\x1b[H");
+        if (process.stdin.isTTY) {
+          process.stdin.setRawMode(true);
+          process.stdin.resume();
+        }
+        break;
+      default:
+        console.log("Invalid choice.");
     }
   }
 }
 
 // ============================================================================
-// ACCOUNT LOGGING
+// MINING CONTEXT
 // ============================================================================
 
-async function logAccountOwner(
-  connection: anchor.web3.Connection,
-  name: string,
-  pubkey: PublicKey,
-  expectedOwner?: PublicKey
-) {
-  const info = await connection.getAccountInfo(pubkey);
-  if (!info) {
-    console.log(`   ${name}: ${pubkey.toString()} (missing)`);
-    return;
-  }
-  const owner = info.owner;
-  const ok = expectedOwner ? owner.equals(expectedOwner) : true;
-  const ownerLabel = expectedOwner
-    ? `${owner.toString()}${ok ? "" : " (unexpected)"}`
-    : owner.toString();
-  console.log(`   ${name}: ${pubkey.toString()} owner=${ownerLabel}`);
+interface MiningContext {
+  connection: anchor.web3.Connection;
+  mxePublicKey: Uint8Array;
+  privacyConfig: PublicKey;
+  privacyAuthority: PublicKey;
+  sharedTokenVault: PublicKey;
+  sharedFeeVault: PublicKey;
+  signPdaAccount: PublicKey;
+  mxeAccount: PublicKey;
+  mempoolAccount: PublicKey;
+  executingPool: PublicKey;
+  clusterAccount: PublicKey;
+  tokenProgramId: PublicKey;
+  privacyIdl: any;
+  protocolIdl: any;
+  // pow-protocol PDAs
+  powConfig: PublicKey;
+  powOtherPool: PublicKey;
+  powMintAuthority: PublicKey;
+  powFeeVault: PublicKey;
+  cycleGate: PublicKey;
+  privacyMinerStats: PublicKey;
+  mineBlockCompDef: PublicKey;
+  depositTokenCompDef: PublicKey;
+  addressLookupTable: AddressLookupTableAccount | null;
 }
 
 // ============================================================================
@@ -1730,565 +1072,444 @@ async function logAccountOwner(
 // ============================================================================
 
 async function main() {
-  console.log("");
-  console.log("  +=============================================================+");
-  console.log("  |       PRIVACY GPU MINER with ARCIUM MPC                     |");
-  console.log("  |       Destinations encrypted, only MPC can decrypt          |");
-  console.log("  +=============================================================+");
-  console.log("");
+  const dashboard = createDashboardState();
+  let stopRenderer = startDashboardRenderer(dashboard);
+  let activeGpu: { kill: () => void } | null = null;
 
-  const connection = new anchor.web3.Connection(config.rpc_url, "confirmed");
-
-  // Wallet (acts as relayer)
-  const walletKeypair = Keypair.fromSecretKey(
-    new Uint8Array(JSON.parse(fs.readFileSync(relayerWalletPath, "utf-8")))
-  );
-  const wallet = new anchor.Wallet(walletKeypair);
-
-  const provider = new anchor.AnchorProvider(connection, wallet, { commitment: "confirmed" });
-  anchor.setProvider(provider);
-
-  // Detect token program from mint owner
-  const mintInfo = await connection.getAccountInfo(MINT);
-  if (!mintInfo) {
-    console.error("Mint account not found:", MINT.toString());
-    process.exit(1);
-  }
-  let tokenProgramId: PublicKey;
-  if (mintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
-    tokenProgramId = TOKEN_2022_PROGRAM_ID;
-  } else if (mintInfo.owner.equals(TOKEN_PROGRAM_ID)) {
-    tokenProgramId = TOKEN_PROGRAM_ID;
-  } else {
-    console.error("Unsupported mint owner:", mintInfo.owner.toString());
-    process.exit(1);
-  }
-
-  console.log("Relayer:", wallet.publicKey.toString());
-  console.log("RPC:", config.rpc_url);
-  console.log("Token Program:", tokenProgramId.toString());
-  console.log("Mode: Privacy Pool with Arcium MPC");
-  console.log("");
-
-  // =========================================================================
-  // Initialize Arcium
-  // =========================================================================
-
-  console.log("Initializing Arcium MPC...");
-  console.log(
-    `   Arcium cluster offset: ${ARCIUM_CLUSTER_OFFSET}${
-      ARCIUM_CLUSTER_OFFSET_FROM_ENV ? "" : " (default)"
-    }`
-  );
-
-  const mxeAccount = getMXEAccAddress(POW_PRIVACY_ID);
-  console.log("   MXE Account:", mxeAccount.toString());
-
-  let mxePublicKey: Uint8Array | null = null;
-  for (let attempt = 1; attempt <= 5; attempt++) {
-    try {
-      mxePublicKey = await getMXEPublicKey(provider, POW_PRIVACY_ID);
-      if (mxePublicKey) {
-        console.log("   MXE x25519 Key:", Buffer.from(mxePublicKey).toString("hex").substring(0, 32) + "...");
-        break;
-      }
-    } catch (e) {
-      console.log(`   Attempt ${attempt} failed, retrying...`);
-      await new Promise(r => setTimeout(r, 1000));
-    }
-  }
-
-  if (!mxePublicKey) {
-    console.error("Failed to get MXE public key! Is DKG complete?");
-    process.exit(1);
-  }
-
-  const clusterAccount = getClusterAccAddress(ARCIUM_CLUSTER_OFFSET);
-  const mempoolAccount = getMempoolAccAddress(ARCIUM_CLUSTER_OFFSET);
-  const executingPool = getExecutingPoolAccAddress(ARCIUM_CLUSTER_OFFSET);
-
-  console.log("   Cluster:", clusterAccount.toString().substring(0, 16) + "...");
-  console.log("   Mempool:", mempoolAccount.toString().substring(0, 16) + "...");
-  console.log("   Executing Pool:", executingPool.toString().substring(0, 16) + "...");
-  console.log("Arcium MPC ready!\n");
-
-  // =========================================================================
-  // Load Programs
-  // =========================================================================
-
-  const powProtocolIdl = JSON.parse(fs.readFileSync(__dirname + "/../target/idl/pow_protocol.json", "utf-8"));
-  const powPrivacyIdl = JSON.parse(fs.readFileSync(__dirname + "/../target/idl/pow_privacy.json", "utf-8"));
-
-  const idlProgramId = new PublicKey(powProtocolIdl.address);
-  if (!idlProgramId.equals(POW_PROTOCOL_ID)) {
-    console.log(
-      `Warning: IDL program_id (${idlProgramId.toString()}) differs from constant (${POW_PROTOCOL_ID.toString()}). Using constant.`
-    );
-  }
-
-  const powProtocol = new Program(powProtocolIdl, provider);
-  const powPrivacy = new Program(powPrivacyIdl, provider);
-
-  // PDAs - pow-protocol (normal pool = pool_id 0)
-  const [powConfig] = PublicKey.findProgramAddressSync([POW_CONFIG_SEED, Buffer.from([POOL_NORMAL])], POW_PROTOCOL_ID);
-  const [powOtherPool] = PublicKey.findProgramAddressSync([POW_CONFIG_SEED, Buffer.from([POOL_SEEKER])], POW_PROTOCOL_ID);
-  const [powMintAuthority] = PublicKey.findProgramAddressSync([POW_MINT_AUTHORITY_SEED], POW_PROTOCOL_ID);
-  const [powFeeVault] = PublicKey.findProgramAddressSync([POW_FEE_VAULT_SEED], POW_PROTOCOL_ID);
-
-  // PDAs - pow-privacy
-  const [privacyConfig] = PublicKey.findProgramAddressSync([PRIVACY_CONFIG_SEED], POW_PRIVACY_ID);
-  const [privacyAuthority] = PublicKey.findProgramAddressSync(
-    [PRIVACY_AUTHORITY_SEED, privacyConfig.toBuffer()],
-    POW_PRIVACY_ID
-  );
-  const [sharedTokenVault] = PublicKey.findProgramAddressSync(
-    [SHARED_TOKEN_VAULT_SEED, privacyConfig.toBuffer(), MINT.toBuffer()],
-    POW_PRIVACY_ID
-  );
-  const [sharedFeeVault] = PublicKey.findProgramAddressSync(
-    [SHARED_FEE_VAULT_SEED, privacyConfig.toBuffer()],
-    POW_PRIVACY_ID
-  );
-
-  const [privacyMinerStats] = PublicKey.findProgramAddressSync(
-    [POW_MINER_STATS_SEED, Buffer.from([POOL_NORMAL]), privacyAuthority.toBuffer()],
-    POW_PROTOCOL_ID
-  );
-
-  const [signPdaAccount] = PublicKey.findProgramAddressSync(
-    [SIGN_PDA_SEED],
-    POW_PRIVACY_ID
-  );
-
-  const mineBlockOffset = Buffer.from(getCompDefAccOffset("mine_block")).readUInt32LE();
-  const mineBlockCompDef = getCompDefAccAddress(POW_PRIVACY_ID, mineBlockOffset);
-
-  console.log("PDAs:");
-  console.log("  Privacy Config:", privacyConfig.toString());
-  console.log("  Privacy Authority:", privacyAuthority.toString());
-  console.log("  Sign PDA:", signPdaAccount.toString());
-  console.log("  mine_block CompDef:", mineBlockCompDef.toString());
-  console.log("");
-
-  console.log("Account ownership check:");
-  await logAccountOwner(connection, "privacyConfig", privacyConfig, POW_PRIVACY_ID);
-  await logAccountOwner(connection, "powConfig", powConfig, POW_PROTOCOL_ID);
-  await logAccountOwner(connection, "mint", MINT, tokenProgramId);
-  await logAccountOwner(connection, "sharedTokenVault", sharedTokenVault, tokenProgramId);
-  await logAccountOwner(connection, "sharedFeeVault", sharedFeeVault);
-  await logAccountOwner(connection, "privacyMinerStats", privacyMinerStats);
-  await logAccountOwner(connection, "powFeeCollector", powFeeVault);
-  await logAccountOwner(connection, "mxeAccount", mxeAccount, ARCIUM_PROGRAM_ID);
-  await logAccountOwner(connection, "clusterAccount", clusterAccount, ARCIUM_PROGRAM_ID);
-  await logAccountOwner(connection, "mempoolAccount", mempoolAccount, ARCIUM_PROGRAM_ID);
-  await logAccountOwner(connection, "executingPool", executingPool, ARCIUM_PROGRAM_ID);
-  await logAccountOwner(connection, "compDefAccount(store_claim)", mineBlockCompDef, ARCIUM_PROGRAM_ID);
-  await logAccountOwner(connection, "feePool", ARCIUM_FEE_POOL, ARCIUM_PROGRAM_ID);
-  await logAccountOwner(connection, "clockAccount", ARCIUM_CLOCK, ARCIUM_PROGRAM_ID);
-  await logAccountOwner(connection, "signPdaAccount", signPdaAccount, POW_PRIVACY_ID);
-  console.log("");
-
-  // Check if privacy protocol is initialized
-  const privacyConfigAccount = await connection.getAccountInfo(privacyConfig);
-  if (!privacyConfigAccount) {
-    console.log("Privacy protocol not initialized!");
-    console.log("Run: npx ts-node scripts/init-privacy.ts");
-    process.exit(1);
-  }
-
-  // =========================================================================
-  // Load Address Lookup Table (ALT) for versioned transactions
-  // =========================================================================
-  let addressLookupTableAccount: AddressLookupTableAccount | null = null;
-  try {
-    const altConfigPath = __dirname + "/../alt-config.json";
-    const altConfig = JSON.parse(fs.readFileSync(altConfigPath, "utf-8"));
-    const altAddress = new PublicKey(altConfig.altAddress);
-    const altAccountInfo = await connection.getAddressLookupTable(altAddress);
-    if (altAccountInfo.value) {
-      addressLookupTableAccount = altAccountInfo.value;
-      console.log(`ALT loaded: ${altAddress.toString()} (${addressLookupTableAccount.state.addresses.length} addresses)`);
-    } else {
-      console.log("Warning: ALT account not found, transactions may be too large");
-    }
-  } catch (e: any) {
-    console.log("Warning: Could not load ALT config:", e.message);
-    console.log("Run: npx ts-node scripts/create-alt.ts");
-  }
-
-  // Initialize claim context for manual claiming from menu
-  claimContext = {
-    provider,
-    program: powPrivacy,
-    connection,
-    wallet,
-    tokenProgramId,
-    privacyConfig,
-    privacyAuthority,
-    sharedTokenVault,
-    mxeAccount,
-    mempoolAccount,
-    executingPool,
-    clusterAccount,
-    signPdaAccount,
-    mxePublicKey,
+  const shutdown = () => {
+    activeGpu?.kill();
+    stopRenderer();
+    if (process.stdout.isTTY) process.stdout.write("\n");
+    process.exit(0);
   };
+  process.once("SIGINT", shutdown);
 
-  // Setup keyboard listener for menu
-  setupKeyboardListener(
-    provider, powPrivacy, connection, wallet, mxePublicKey,
-    privacyConfig, sharedFeeVault, mxeAccount,
-    mempoolAccount, executingPool, clusterAccount, signPdaAccount
-  );
+  try {
+    setPhase(dashboard, "booting", `Loading for ${networkLabel}`);
+    pushEvent(dashboard, `Config: ${networkLabel}`);
+    renderDashboard(dashboard);
 
-  // =========================================================================
-  // Load pending claims from database
-  // =========================================================================
-  console.log("Loading pending claims from database...");
-  const dbPendingClaims = claimsDb.getPendingClaims();
-  const stats = claimsDb.getClaimStats();
-  console.log(`   Found ${dbPendingClaims.length} pending claims in database`);
-  console.log(`   Total claims: ${stats.total} | Claimed: ${stats.claimed} | Failed: ${stats.failed}`);
+    const connection = new anchor.web3.Connection(currentRpcUrl, "confirmed");
 
-  // Load into memory for quick access during mining
-  for (const dbClaim of dbPendingClaims) {
-    const claim = claimsDb.claimRecordToPendingClaim(dbClaim);
-    // Check if not already in memory
-    if (!pendingClaims.some(p => p.claimId === claim.claimId)) {
-      pendingClaims.push({
-        claimId: claim.claimId,
-        secret: claim.secret,
-        destinationWallet: claim.destinationWallet,
-        destinationPubkey: claim.destinationPubkey,
-        clientPrivateKey: claim.clientPrivateKey,
-        computationOffset: new anchor.BN(claim.computationOffset),
-        createdAt: claim.createdAt,
-      });
+    // Detect token program
+    const mintInfo = await connection.getAccountInfo(MINT);
+    if (!mintInfo) throw new Error("Mint not found");
+    const tokenProgramId = mintInfo.owner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+
+    // Load IDLs
+    const privacyIdl = JSON.parse(fs.readFileSync(__dirname + "/../target/idl/pow_privacy.json", "utf-8"));
+    const protocolIdl = JSON.parse(fs.readFileSync(__dirname + "/../target/idl/pow_protocol.json", "utf-8"));
+
+    // Arcium setup
+    pushEvent(dashboard, "Initializing Arcium MPC...");
+    renderDashboard(dashboard);
+
+    const mxeAccount = getMXEAccAddress(POW_PRIVACY_ID);
+    let mxePublicKey: Uint8Array | null = null;
+
+    // We need a temporary provider for MXE key fetch
+    // Use first relayer or miner wallet
+    const tempKp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8"))));
+    const tempWallet = new anchor.Wallet(tempKp);
+    const tempProvider = new anchor.AnchorProvider(connection, tempWallet, { commitment: "confirmed" });
+    anchor.setProvider(tempProvider);
+
+    dashboard.minerWallet = tempKp.publicKey.toString();
+
+    for (let i = 1; i <= 5; i++) {
+      try {
+        mxePublicKey = await getMXEPublicKey(tempProvider, POW_PRIVACY_ID);
+        if (mxePublicKey) break;
+      } catch { await sleep(1000); }
     }
-  }
-  if (pendingClaims.length > 0) {
-    console.log(`   Loaded ${pendingClaims.length} claims into memory`);
-  }
-  console.log("");
+    if (!mxePublicKey) throw new Error("Failed to get MXE public key");
 
-  console.log("Starting privacy mining with Arcium MPC...\n");
+    const clusterAccount = getClusterAccAddress(ARCIUM_CLUSTER_OFFSET);
+    const mempoolAccount = getMempoolAccAddress(ARCIUM_CLUSTER_OFFSET);
+    const executingPool = getExecutingPoolAccAddress(ARCIUM_CLUSTER_OFFSET);
 
-  let sessionBlockCount = 0;
+    pushEvent(dashboard, "Arcium MPC ready");
+    renderDashboard(dashboard);
 
-  while (isMining) {
-    // Skip mining if menu is active (auto-pause when menu is open)
-    if (menuActive) {
-      await new Promise(r => setTimeout(r, 1000));
-      continue;
-    }
+    // PDAs
+    const [privacyConfig] = PublicKey.findProgramAddressSync([PRIVACY_CONFIG_SEED], POW_PRIVACY_ID);
+    const [privacyAuthority] = PublicKey.findProgramAddressSync([PRIVACY_AUTHORITY_SEED, privacyConfig.toBuffer()], POW_PRIVACY_ID);
+    const [sharedTokenVault] = PublicKey.findProgramAddressSync([SHARED_TOKEN_VAULT_SEED, privacyConfig.toBuffer(), MINT.toBuffer()], POW_PRIVACY_ID);
+    const [sharedFeeVault] = PublicKey.findProgramAddressSync([SHARED_FEE_VAULT_SEED, privacyConfig.toBuffer()], POW_PRIVACY_ID);
+    const [signPdaAccount] = PublicKey.findProgramAddressSync([SIGN_PDA_SEED], POW_PRIVACY_ID);
+    const [powConfig] = PublicKey.findProgramAddressSync([POW_CONFIG_SEED, Buffer.from([POOL_NORMAL])], POW_PROTOCOL_ID);
+    const [powOtherPool] = PublicKey.findProgramAddressSync([POW_CONFIG_SEED, Buffer.from([POOL_SEEKER])], POW_PROTOCOL_ID);
+    const [powMintAuthority] = PublicKey.findProgramAddressSync([POW_MINT_AUTHORITY_SEED], POW_PROTOCOL_ID);
+    const [powFeeVault] = PublicKey.findProgramAddressSync([POW_FEE_VAULT_SEED], POW_PROTOCOL_ID);
+    const [cycleGate] = PublicKey.findProgramAddressSync([Buffer.from("cycle_gate")], POW_PROTOCOL_ID);
+    const [privacyMinerStats] = PublicKey.findProgramAddressSync(
+      [POW_MINER_STATS_SEED, Buffer.from([POOL_NORMAL]), privacyAuthority.toBuffer()], POW_PROTOCOL_ID,
+    );
 
+    const mineBlockOffset = Buffer.from(getCompDefAccOffset("mine_block")).readUInt32LE();
+    const mineBlockCompDef = getCompDefAccAddress(POW_PRIVACY_ID, mineBlockOffset);
+    const depositTokenOffset = Buffer.from(getCompDefAccOffset("deposit_token")).readUInt32LE();
+    const depositTokenCompDef = getCompDefAccAddress(POW_PRIVACY_ID, depositTokenOffset);
+
+    // ALT
+    let addressLookupTable: AddressLookupTableAccount | null = null;
     try {
-      // NOTE: Claims are now processed manually via menu [K] option
-      // This prevents automatic claiming and gives user control
+      const altConfig = JSON.parse(fs.readFileSync(__dirname + "/../alt-config.json", "utf-8"));
+      const altInfo = await connection.getAddressLookupTable(new PublicKey(altConfig.altAddress));
+      if (altInfo.value) addressLookupTable = altInfo.value;
+    } catch {}
 
-      // =====================================================================
-      // 1. FETCH PROTOCOL STATE
-      // =====================================================================
+    const ctx: MiningContext = {
+      connection, mxePublicKey, privacyConfig, privacyAuthority, sharedTokenVault, sharedFeeVault,
+      signPdaAccount, mxeAccount, mempoolAccount, executingPool, clusterAccount, tokenProgramId,
+      privacyIdl, protocolIdl, powConfig, powOtherPool, powMintAuthority, powFeeVault, cycleGate,
+      privacyMinerStats, mineBlockCompDef, depositTokenCompDef, addressLookupTable,
+    };
 
-      const powConfigAccount = await connection.getAccountInfo(powConfig);
-      if (!powConfigAccount) throw new Error("PoW Config not found");
-
-      const data = powConfigAccount.data;
-      const difficultyLow = data.readBigUInt64LE(72);
-      const difficultyHigh = data.readBigUInt64LE(80);
-      const difficulty = BigInt(difficultyLow) | (BigInt(difficultyHigh) << 64n);
-      const blocksMined = data.readBigUInt64LE(96);
-      const challenge = Buffer.from(data.slice(112, 144));
-
-      const privacyConfigData = await (powPrivacy.account as any).privacyConfig.fetch(privacyConfig);
-      const nextClaimId = privacyConfigData.nextClaimId as anchor.BN;
-
-      console.log("===============================================================");
-      console.log(`Block #${blocksMined} | Difficulty: ${difficulty.toLocaleString()}`);
-      console.log(`Challenge: ${challenge.toString("hex").substring(0, 16)}...`);
-
-      // =====================================================================
-      // 2. GENERATE PRIVACY DATA + ENCRYPT WITH ARCIUM
-      // =====================================================================
-
-      const secret = generateSecret();
-      const secretHash = hashSecret(secret);
-
-      // Use default destination wallet if set, otherwise generate new
-      let destinationWallet: Keypair;
-      if (defaultClaimWalletPath) {
-        try {
-          destinationWallet = Keypair.fromSecretKey(
-            new Uint8Array(JSON.parse(fs.readFileSync(defaultClaimWalletPath, "utf-8")))
-          );
-        } catch (e) {
-          console.log(`Warning: Could not load claim wallet from ${defaultClaimWalletPath}, using random`);
-          destinationWallet = generateDestinationWallet();
-        }
-      } else {
-        destinationWallet = generateDestinationWallet();
-      }
-
-      const clientPrivateKey = x25519.utils.randomSecretKey();
-
-      const { ciphertext, clientPublicKey, nonce } = encryptDestination(
-        destinationWallet.publicKey,
-        mxePublicKey,
-        clientPrivateKey
-      );
-
-      console.log(`Encrypted destination (MPC-only readable)`);
-      console.log(`   Real dest: ${destinationWallet.publicKey.toString().substring(0, 16)}...`);
-      console.log(`   Client key: ${Buffer.from(clientPublicKey).toString("hex").substring(0, 16)}...`);
-
-      // Check if menu was opened while preparing
-      if (menuActive) {
-        console.log("Menu opened, pausing mining...");
-        continue;
-      }
-
-      // =====================================================================
-      // 3. MINE WITH GPU (with parallel challenge monitoring)
-      // =====================================================================
-
-      console.log("Mining with GPU...");
-
-      const minerPubkeyHex = privacyAuthority.toBuffer().toString("hex");
-      const currentChallenge = challenge.toString("hex");
-
-      // Start challenge monitor in parallel - checks every 5 seconds if someone else mined
-      let challengeChanged = false;
-      const challengeMonitor = setInterval(async () => {
-        try {
-          const freshConfig = await connection.getAccountInfo(powConfig);
-          if (freshConfig) {
-            const freshChallenge = Buffer.from(freshConfig.data.slice(112, 144)).toString("hex");
-            if (freshChallenge !== currentChallenge) {
-              console.log("\n⚠ New block detected! Stopping current mining...");
-              challengeChanged = true;
-              killMiningProcess();
-              clearInterval(challengeMonitor);
-            }
+    // Setup keyboard listener
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", async (key: string) => {
+        if (key === "\u0003") shutdown();
+        if ((key === "m" || key === "M") && !menuActive) {
+          // Kill GPU immediately & stop dashboard
+          activeGpu?.kill();
+          activeGpu = null;
+          stopRenderer();
+          await handleMenu(ctx);
+          if (isMining) {
+            // Restart dashboard
+            renderer.active = false;
+            renderer.previousLines = [];
+            if (!renderer.cursorHidden) { process.stdout.write("\x1b[?25l"); renderer.cursorHidden = true; }
+            dashboard.relayerCount = db.getActiveRelayers().length;
+            dashboard.claimerCount = db.getActiveClaimers().length;
+            renderDashboard(dashboard);
+            stopRenderer = startDashboardRenderer(dashboard);
           }
-        } catch (e) {
-          // Ignore errors in monitor
         }
-      }, 5000);
-
-      const result = await mineWithGpu(
-        currentChallenge,
-        minerPubkeyHex,
-        Number(blocksMined),
-        Number(difficulty)
-      );
-
-      clearInterval(challengeMonitor);
-
-      // If challenge changed while mining, restart the loop
-      if (challengeChanged) {
-        console.log("Restarting with new challenge...\n");
-        continue;
-      }
-
-      if (result === null) {
-        console.log("GPU mining failed, retrying in 5s...\n");
-        await new Promise(r => setTimeout(r, 5000));
-        continue;
-      }
-
-      console.log(`Nonce: ${result.nonce} | Time: ${(result.time_ms / 1000).toFixed(2)}s | ${result.hashrate.toFixed(2)} MH/s`);
-
-      // =====================================================================
-      // 4. SUBMIT VIA PRIVACY LAYER
-      // =====================================================================
-
-      console.log("Submitting to Arcium MPC...");
-
-      const mineComputationOffset = new anchor.BN(randomBytes(8), "hex");
-
-      const [claimPda] = PublicKey.findProgramAddressSync(
-        [
-          CLAIM_SEED,
-          privacyConfig.toBuffer(),
-          Buffer.from(nextClaimId.toArray('le', 8)),
-        ],
-        POW_PRIVACY_ID
-      );
-
-      const computationAccount = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, mineComputationOffset);
-
-      // Encrypt destination as [[u8; 32]; 4]
-      const encryptedDestinationArray: number[][] = ciphertext.map(c => Array.from(c));
-
-      // Encrypt current miner state (balance, nonce, reserved) as [[u8; 32]; 3]
-      const minerState = loadMinerState();
-      const encryptedState = encryptCurrentState(
-        minerState.balance,
-        minerState.stateNonce,
-        minerState.reserved,
-        mxePublicKey,
-        clientPrivateKey,
-        nonce
-      );
-      const encryptedCurrentStateArray: number[][] = encryptedState.map(c => Array.from(c));
-
-      console.log("   Submitting block...");
-
-      const method = powPrivacy.methods
-        .submitBlockPrivate(
-          mineComputationOffset,
-          new anchor.BN(result.nonce),
-          Array.from(clientPublicKey),
-          new anchor.BN(deserializeLE(nonce).toString()),
-          Array.from(secretHash),
-          encryptedDestinationArray,
-          encryptedCurrentStateArray,
-        )
-        .accounts({
-          relayer: wallet.publicKey,
-          privacyConfig: privacyConfig,
-          privacyAuthority: privacyAuthority,
-          claim: claimPda,
-          sharedTokenVault: sharedTokenVault,
-          sharedFeeVault: sharedFeeVault,
-          powConfig: powConfig,
-          powOtherPool: powOtherPool,
-          powMintAuthority: powMintAuthority,
-          mint: MINT,
-          privacyMinerStats: privacyMinerStats,
-          powFeeCollector: powFeeVault,
-          powProgram: POW_PROTOCOL_ID,
-          tokenProgram: tokenProgramId,
-          systemProgram: SystemProgram.programId,
-          signPdaAccount: signPdaAccount,
-          mxeAccount: mxeAccount,
-          mempoolAccount: mempoolAccount,
-          executingPool: executingPool,
-          computationAccount: computationAccount,
-          compDefAccount: mineBlockCompDef,
-          clusterAccount: clusterAccount,
-          poolAccount: ARCIUM_FEE_POOL,
-          clockAccount: ARCIUM_CLOCK,
-          arciumProgram: ARCIUM_PROGRAM_ID,
-        });
-
-      const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
-        units: 400_000,
       });
-
-      const methodWithBudget = method.preInstructions([computeBudgetIx]);
-
-      // Build instructions from Anchor method
-      const instructions = await methodWithBudget.instruction();
-      const allInstructions = [computeBudgetIx, instructions];
-
-      // Use versioned transaction with ALT to reduce size
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-      const lookupTables = addressLookupTableAccount ? [addressLookupTableAccount] : [];
-
-      const messageV0 = new TransactionMessage({
-        payerKey: wallet.publicKey,
-        recentBlockhash: blockhash,
-        instructions: allInstructions,
-      }).compileToV0Message(lookupTables);
-
-      const versionedTx = new VersionedTransaction(messageV0);
-      versionedTx.sign([walletKeypair]);
-
-      // Simulate first
-      try {
-        const sim = await connection.simulateTransaction(versionedTx, { commitment: "confirmed" });
-        if (sim.value.err) {
-          console.error("Simulation failed:", JSON.stringify(sim.value.err));
-          if (sim.value.logs) {
-            console.error("Simulation logs:");
-            sim.value.logs.slice(-10).forEach((log: string, i: number) => console.error(`  ${i}: ${log}`));
-          }
-          throw new Error(`Simulation error: ${JSON.stringify(sim.value.err)}`);
-        }
-      } catch (simErr: any) {
-        if (simErr?.message?.includes("Simulation error:")) throw simErr;
-        console.error("Simulation failed:", simErr?.message || simErr);
-        throw simErr;
-      }
-
-      const txSig = await connection.sendRawTransaction(versionedTx.serialize(), {
-        skipPreflight: true,
-        maxRetries: 3,
-      });
-      await connection.confirmTransaction({ signature: txSig, blockhash, lastValidBlockHeight }, "confirmed");
-      const tx = txSig;
-
-      sessionBlockCount++;
-
-      const claimIdNumber = nextClaimId.toNumber();
-
-      // Store pending claim in database (persistent)
-      try {
-        claimsDb.insertClaim(
-          claimIdNumber,
-          secret,
-          destinationWallet as Keypair,
-          clientPrivateKey,
-          mineComputationOffset.toBuffer('le', 8),
-          undefined, // amount unknown at this point
-          tx
-        );
-        console.log(`   Claim #${claimIdNumber} saved to database`);
-      } catch (dbErr: any) {
-        // If duplicate, it's OK (already exists from previous run)
-        if (!dbErr?.message?.includes('UNIQUE constraint')) {
-          console.error(`   Warning: Failed to save claim to DB: ${dbErr?.message}`);
-        }
-      }
-
-      // Also keep in memory for quick access
-      pendingClaims.push({
-        claimId: claimIdNumber,
-        secret: secret,
-        destinationWallet: destinationWallet as Keypair,
-        destinationPubkey: (destinationWallet as Keypair).publicKey.toString(),
-        clientPrivateKey: clientPrivateKey,
-        computationOffset: mineComputationOffset,
-        createdAt: Date.now() / 1000,
-      });
-
-      console.log(`Block submitted! TX: ${tx.slice(0, 20)}...`);
-      console.log(`Claim #${claimIdNumber} pending MPC | Session: ${sessionBlockCount} blocks`);
-      console.log(`Pending claims: ${pendingClaims.length} (in-memory) / ${claimsDb.getClaimStats().pending} (in DB)`);
-
-      // Show balance status
-      await printBalanceStatus(connection, sessionBlockCount);
-
-      // Non-blocking MPC finalization - update database on completion
-      awaitComputationFinalization(provider, mineComputationOffset, POW_PRIVACY_ID, "confirmed")
-        .then((sig) => {
-          console.log(`   store_claim #${claimIdNumber} MPC finalized: ${sig.slice(0, 20)}...`);
-          claimsDb.markClaimMpcConfirmed(claimIdNumber);
-        })
-        .catch(() => {
-          console.log(`   store_claim #${claimIdNumber} MPC timeout`);
-          // Don't mark as failed yet - might still be processing
-        });
-
-      await new Promise(r => setTimeout(r, 500));
-
-    } catch (err: any) {
-      const msg = err?.message ?? err?.toString?.() ?? String(err);
-      console.error("Error:", msg);
-      if (err?.error?.errorMessage) {
-        console.error("Anchor error:", err.error.errorMessage);
-      }
-      if (err?.logs) {
-        console.error("Logs:");
-        err.logs.slice(-10).forEach((log: string, i: number) => console.error(`  ${i}: ${log}`));
-      }
-      console.log("Retrying in 5s...\n");
-      await new Promise(r => setTimeout(r, 5000));
     }
+
+    // Update counts
+    dashboard.relayerCount = db.getActiveRelayers().length;
+    dashboard.claimerCount = db.getActiveClaimers().length;
+
+    setPhase(dashboard, "ready", "Miner ready");
+    pushEvent(dashboard, `Relayers: ${dashboard.relayerCount} | Claimers: ${dashboard.claimerCount}`);
+    renderDashboard(dashboard);
+
+    // =========================================================================
+    // MINING LOOP
+    // =========================================================================
+
+    while (isMining) {
+      if (menuActive) { await sleep(500); continue; }
+
+      try {
+        // Pick random relayer
+        const relayer = db.getRandomRelayer();
+        if (!relayer) {
+          setPhase(dashboard, "error", "No relayers configured! Press M to add one.");
+          pushEvent(dashboard, "No relayers - add via menu [2]");
+          renderDashboard(dashboard);
+          await sleep(5000);
+          continue;
+        }
+
+        const relayerKp = db.loadRelayerKeypair(relayer);
+        if (!relayerKp) {
+          pushEvent(dashboard, `Failed to load relayer: ${relayer.name}`);
+          await sleep(2000);
+          continue;
+        }
+
+        if (menuActive) continue;
+
+        dashboard.relayerWallet = relayer.pubkey;
+        const relayerWallet = new anchor.Wallet(relayerKp);
+        const relayerProvider = new anchor.AnchorProvider(connection, relayerWallet, { commitment: "confirmed" });
+        const powPrivacy = new Program(privacyIdl, relayerProvider);
+
+        // Fetch state
+        setPhase(dashboard, "syncing", "Fetching challenge");
+        renderDashboard(dashboard);
+
+        if (menuActive) continue;
+        const protocolState = await readProtocolState(connection, powConfig);
+        dashboard.currentState = protocolState;
+        dashboard.currentNonce = null;
+        pushEvent(dashboard, `Synced #${formatBigInt(protocolState.blocksMined)} | relayer: ${relayer.name}`);
+        setPhase(dashboard, "mining", `Mining #${formatBigInt(protocolState.blocksMined)} on ${dashboard.backend}`);
+        renderDashboard(dashboard);
+
+        // GPU mine
+        const gpu = startGpuMiner(
+          protocolState.challengeHex, privacyAuthority.toBuffer().toString("hex"),
+          protocolState.blocksMined, protocolState.difficulty,
+          (p) => { dashboard.liveHashrate = p.liveHashrate; dashboard.liveAvgHashrate = p.avgHashrate; dashboard.liveHashesChecked = p.hashesChecked; },
+        );
+        activeGpu = gpu;
+
+        const monitor = createChallengeMonitor(connection, powConfig, protocolState, challengePollIntervalMs);
+        const outcome = await Promise.race([
+          gpu.promise.then((r) => ({ source: "gpu" as const, result: r })),
+          monitor.changed.then((s) => ({ source: "chain" as const, state: s })),
+        ]);
+        monitor.stop();
+
+        if (outcome.source === "chain") {
+          if (outcome.state) {
+            activeGpu?.kill();
+            await gpu.promise;
+            activeGpu = null;
+            dashboard.currentState = outcome.state;
+            dashboard.staleBlocks++;
+            dashboard.restartCount++;
+            setPhase(dashboard, "lost", `Block moved to #${formatBigInt(outcome.state.blocksMined)}`);
+            pushEvent(dashboard, `Stale - someone else mined #${formatBigInt(protocolState.blocksMined)}`);
+            renderDashboard(dashboard);
+          }
+          continue;
+        }
+
+        activeGpu = null;
+        const mResult = outcome.result;
+
+        if (mResult.status === "stopped") { dashboard.restartCount++; continue; }
+        if (mResult.status === "error") {
+          dashboard.errorCount++;
+          dashboard.restartCount++;
+          setPhase(dashboard, "error", "GPU failed");
+          pushEvent(dashboard, mResult.reason);
+          renderDashboard(dashboard);
+          await sleep(RETRY_DELAY_MS);
+          continue;
+        }
+
+        dashboard.currentNonce = mResult.nonce;
+        dashboard.lastHashrate = mResult.hashrate;
+        dashboard.lastMiningTimeMs = mResult.timeMs;
+        dashboard.totalHashrate += mResult.hashrate;
+        dashboard.hashrateSamples++;
+        pushEvent(dashboard, `Nonce ${mResult.nonce} in ${(mResult.timeMs / 1000).toFixed(2)}s @ ${mResult.hashrate.toFixed(2)} MH/s`);
+        renderDashboard(dashboard);
+
+        if (menuActive) continue;
+
+        // Check if stale before submit
+        const preSubmit = await readProtocolState(connection, powConfig);
+        dashboard.currentState = preSubmit;
+        if (preSubmit.blocksMined !== protocolState.blocksMined || preSubmit.challengeHex !== protocolState.challengeHex) {
+          dashboard.staleBlocks++;
+          dashboard.restartCount++;
+          setPhase(dashboard, "lost", `Block moved before submit`);
+          pushEvent(dashboard, `Stale before submit`);
+          renderDashboard(dashboard);
+          continue;
+        }
+
+        if (menuActive) continue;
+
+        // =====================================================================
+        // SUBMIT BLOCK
+        // =====================================================================
+
+        // Snapshot vault balance before submit to compute reward delta
+        let vaultBalanceBefore = 0n;
+        try {
+          const vb = await connection.getTokenAccountBalance(sharedTokenVault);
+          vaultBalanceBefore = BigInt(vb.value.amount);
+        } catch {}
+
+        setPhase(dashboard, "submitting", `Submitting #${formatBigInt(protocolState.blocksMined)}`);
+        renderDashboard(dashboard);
+
+        const clientSk = x25519.utils.randomSecretKey();
+        const clientPk = x25519.getPublicKey(clientSk);
+        const nonce = randomBytes(16);
+        const minerState = db.loadMinerState();
+        const encState = encryptCurrentState(
+          minerState.balance, minerState.stateNonce, minerState.reserved,
+          mxePublicKey, clientSk, nonce,
+        );
+
+        const mineCompOffset = new anchor.BN(randomBytes(8), "hex");
+        const computationAccount = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, mineCompOffset);
+
+        const method = powPrivacy.methods
+          .submitBlockPrivate(
+            mineCompOffset,
+            new anchor.BN(mResult.nonce.toString()),
+            Array.from(clientPk),
+            new anchor.BN(deserializeLE(nonce).toString()),
+            encState.map((c) => Array.from(c)),
+          )
+          .accounts({
+            relayer: relayerWallet.publicKey,
+            privacyConfig, privacyAuthority, sharedTokenVault, sharedFeeVault,
+            powConfig, powOtherPool: ctx.powOtherPool, powMintAuthority: ctx.powMintAuthority,
+            mint: MINT, privacyMinerStats: ctx.privacyMinerStats,
+            powFeeCollector: ctx.powFeeVault, cycleGate: ctx.cycleGate,
+            powProgram: POW_PROTOCOL_ID, tokenProgram: tokenProgramId,
+            systemProgram: SystemProgram.programId, signPdaAccount,
+            mxeAccount, mempoolAccount, executingPool, computationAccount,
+            compDefAccount: mineBlockCompDef, clusterAccount,
+            poolAccount: ARCIUM_FEE_POOL, clockAccount: ARCIUM_CLOCK,
+            arciumProgram: ARCIUM_PROGRAM_ID,
+          });
+
+        const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 });
+        const ix = await method.preInstructions([computeBudgetIx]).instruction();
+        const allIx = [computeBudgetIx, ix];
+
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+        const lookupTables = addressLookupTable ? [addressLookupTable] : [];
+        const msgV0 = new TransactionMessage({
+          payerKey: relayerWallet.publicKey,
+          recentBlockhash: blockhash,
+          instructions: allIx,
+        }).compileToV0Message(lookupTables);
+
+        const vtx = new VersionedTransaction(msgV0);
+        vtx.sign([relayerKp]);
+
+        // Simulate
+        const sim = await connection.simulateTransaction(vtx, { commitment: "confirmed" });
+        if (sim.value.err) {
+          dashboard.errorCount++;
+          pushEvent(dashboard, `Sim failed: ${JSON.stringify(sim.value.err)}`);
+          if (sim.value.logs) pushEvent(dashboard, truncate(sim.value.logs.slice(-3).join(" | "), 160));
+          renderDashboard(dashboard);
+          await sleep(RETRY_DELAY_MS);
+          continue;
+        }
+
+        const txSig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 3 });
+        await connection.confirmTransaction({ signature: txSig, blockhash, lastValidBlockHeight }, "confirmed");
+
+        dashboard.lastTx = txSig;
+        pushEvent(dashboard, `Block submitted: ${formatShort(txSig, 12, 8)}`);
+
+        // Update SOL state (mine_block deducted fee)
+        const s = db.loadMinerState();
+        // We don't know exact fee here - MPC handles it
+        s.stateNonce += 1n;
+        db.saveMinerState(s);
+
+        // Non-blocking MPC finalization for mine_block
+        awaitComputationFinalization(relayerProvider, mineCompOffset, POW_PRIVACY_ID, "confirmed")
+          .then(() => pushEvent(dashboard, `mine_block MPC confirmed`))
+          .catch(() => pushEvent(dashboard, `mine_block MPC timeout`));
+
+        // =====================================================================
+        // DEPOSIT TOKEN (credit HASHISH reward to encrypted balance)
+        // =====================================================================
+
+        setPhase(dashboard, "depositing", "Crediting HASHISH reward...");
+        renderDashboard(dashboard);
+
+        try {
+          // Compute reward as vault balance delta (after mint - before mint)
+          let vaultBalanceAfter = 0n;
+          try {
+            const vb = await connection.getTokenAccountBalance(sharedTokenVault);
+            vaultBalanceAfter = BigInt(vb.value.amount);
+          } catch {}
+          const rewardPerBlock = vaultBalanceAfter - vaultBalanceBefore;
+          if (rewardPerBlock <= 0n) {
+            pushEvent(dashboard, `Vault delta <= 0, skipping deposit_token`);
+            throw new Error("No reward detected");
+          }
+          pushEvent(dashboard, `Reward detected: ${rewardPerBlock.toString()} raw tokens`);
+
+          const tokenClientSk = x25519.utils.randomSecretKey();
+          const tokenClientPk = x25519.getPublicKey(tokenClientSk);
+          const tokenNonce = randomBytes(16);
+          const currentState = db.loadMinerState();
+
+          const encTokenAmt = encryptAmount(rewardPerBlock, mxePublicKey, tokenClientSk, tokenNonce);
+          const encTokenState = encryptCurrentTokenState(
+            currentState.tokenBalance, currentState.tokenNonce, currentState.tokenReserved,
+            mxePublicKey, tokenClientSk, tokenNonce,
+          );
+
+          // Use miner wallet for deposit_token (not relayer)
+          const minerKp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(minerWalletPath, "utf-8"))));
+          const minerWalletAnchor = new anchor.Wallet(minerKp);
+          const minerProvider = new anchor.AnchorProvider(connection, minerWalletAnchor, { commitment: "confirmed" });
+          const minerProgram = new Program(privacyIdl, minerProvider);
+
+          const [depositTokenBuffer] = PublicKey.findProgramAddressSync(
+            [DEPOSIT_TOKEN_BUFFER_SEED, minerKp.publicKey.toBuffer(), encTokenAmt.slice(0, 8)], POW_PRIVACY_ID,
+          );
+
+          await minerProgram.methods
+            .createDepositTokenBuffer(
+              Array.from(encTokenAmt), encTokenState.map((c) => Array.from(c)),
+              Array.from(tokenClientPk), new anchor.BN(deserializeLE(tokenNonce).toString()),
+              new anchor.BN(rewardPerBlock.toString()),
+            )
+            .accounts({ depositor: minerKp.publicKey, privacyConfig, depositTokenBuffer, systemProgram: SystemProgram.programId })
+            .rpc();
+
+          const tokenCompOffset = new anchor.BN(randomBytes(8), "hex");
+          const tokenCompAcc = getComputationAccAddress(ARCIUM_CLUSTER_OFFSET, tokenCompOffset);
+
+          await minerProgram.methods.depositTokenPrivate(tokenCompOffset)
+            .accounts({
+              depositor: minerKp.publicKey, privacyConfig, depositTokenBuffer,
+              owner: minerKp.publicKey, systemProgram: SystemProgram.programId,
+              signPdaAccount, mxeAccount, mempoolAccount, executingPool,
+              computationAccount: tokenCompAcc, compDefAccount: depositTokenCompDef,
+              clusterAccount, poolAccount: ARCIUM_FEE_POOL, clockAccount: ARCIUM_CLOCK,
+              arciumProgram: ARCIUM_PROGRAM_ID,
+            })
+            .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 })])
+            .rpc({ skipPreflight: true });
+
+          // Non-blocking MPC finalization for deposit_token
+          awaitComputationFinalization(minerProvider, tokenCompOffset, POW_PRIVACY_ID, "confirmed")
+            .then(() => {
+              const st = db.loadMinerState();
+              st.tokenBalance += rewardPerBlock;
+              st.tokenNonce += 1n;
+              db.saveMinerState(st);
+              pushEvent(dashboard, `HASHISH credited: +${rewardPerBlock.toString()} tokens`);
+            })
+            .catch(() => pushEvent(dashboard, `deposit_token MPC timeout`));
+
+        } catch (dtErr: any) {
+          pushEvent(dashboard, `deposit_token failed: ${truncate(dtErr?.message || "", 80)}`);
+        }
+
+        // Wait for state advance
+        const advancedState = (await waitForStateAdvance(connection, powConfig, protocolState, 12_000))
+          ?? (await readProtocolState(connection, powConfig));
+        dashboard.currentState = advancedState;
+        dashboard.blocksWon++;
+        setPhase(dashboard, "won", `Block #${formatBigInt(protocolState.blocksMined)} accepted`);
+        pushEvent(dashboard, `Won #${formatBigInt(protocolState.blocksMined)}`);
+        renderDashboard(dashboard);
+        await sleep(POST_WIN_PAUSE_MS);
+
+      } catch (err: any) {
+        dashboard.errorCount++;
+        dashboard.restartCount++;
+        setPhase(dashboard, "error", "Error, retrying");
+        pushEvent(dashboard, `Error: ${truncate(err?.message ?? String(err), 80)}`);
+        if (err?.logs) pushEvent(dashboard, truncate(err.logs.slice(-3).join(" | "), 160));
+        renderDashboard(dashboard);
+        await sleep(RETRY_DELAY_MS);
+      }
+    }
+  } finally {
+    stopRenderer();
   }
 
-  console.log("\nMiner stopped. Goodbye!");
+  console.log("\nMiner stopped.");
   process.exit(0);
 }
 

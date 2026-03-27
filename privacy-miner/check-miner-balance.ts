@@ -20,7 +20,7 @@ import fs from "fs";
 const useLocal = process.argv.includes("--local");
 const configPath = useLocal
   ? __dirname + "/../miner-config.json"
-  : __dirname + "/../miner-config-devnet.json";
+  : __dirname + "/../miner-config.json";
 
 let config: any;
 try {
@@ -30,7 +30,7 @@ try {
 }
 
 // Program IDs
-const POW_PRIVACY_ID = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
+const POW_PRIVACY_ID = new PublicKey("AMmu8GcoNUAdnRNKU5AqgNGdLJSLh9WLxxzxFkdtXwCh");
 
 // Seeds
 const PRIVACY_CONFIG_SEED = Buffer.from("privacy_config");

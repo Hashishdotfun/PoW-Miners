@@ -1,7 +1,7 @@
 {
-  "rpc_url": "https://api.devnet.solana.com",
-  "program_id": "Ai9XrxSUmDLNCXkoeoqnYuzPgN9F2PeF9WtLq9GyqER",
-  "mint": "ACnhuoJn41PQQKfhuHYgAQXR3jPSg1i4zr59Qt68QAUR",
+  "rpc_url": "https://api.mainnet-beta.solana.com",
+  "program_id": "PoWQ79wY7LXrKaU8vZBoFb4JgSytENSdpAQAPJaZiSh",
+  "mint": "HASHcf66ffcWdGvswuuu8ssLWSeXpto6QaeG32AktiSh",
   "wallet_path": "/path/to/your/wallet.json",
   "gpu_backend": "cuda",
   "gpu_device": 0,
@@ -9,5 +9,5 @@
   "cuda_num_blocks": 1024,
   "challenge_poll_interval_ms": 1500,
   "relayer_wallet_path": "/path/to/your/relayer.json",
-  "pool_id": "B9g6VbfTeJb2LERzWpFGYQMd1Pi93pzmA1v5XdDiUm98"
+  "pool_id": "0"
 }

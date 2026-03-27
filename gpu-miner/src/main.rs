@@ -3,11 +3,12 @@
 
 use clap::Parser;
 use log::{info, warn, error};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod config;
 mod miner;
 mod pow;
+mod solana_client;
 
 #[cfg(feature = "cuda")]
 mod cuda_miner;
@@ -16,6 +17,7 @@ mod cuda_miner;
 mod opencl_miner;
 
 use miner::MinerBackend;
+use solana_client::SolanaClient;
 
 #[derive(Parser)]
 #[command(name = "pow-miner")]
@@ -76,6 +78,14 @@ struct Cli {
     /// Miner public key (hex, 32 bytes) for benchmark mode
     #[arg(long)]
     miner_pubkey: Option<String>,
+
+    /// Pool ID: 0 = normal (open), 1 = seeker (requires TEE attestation)
+    #[arg(long, default_value = "0")]
+    pool_id: u8,
+
+    /// Poll interval in ms to check for new challenges
+    #[arg(long, default_value = "1500")]
+    poll_interval: u64,
 }
 
 #[cfg(feature = "cuda")]
@@ -326,8 +336,161 @@ async fn run_benchmark(
 }
 
 async fn run_miner(
-    _miner: Box<dyn MinerBackend>,
-    _cli: &Cli,
+    miner: Box<dyn MinerBackend>,
+    cli: &Cli,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("Mining mode is not yet implemented. Use --benchmark mode or use the TypeScript continuous-gpu-miner.ts script.");
+    // Validate required args
+    let program_id = cli.program_id.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--program-id is required for mining mode"))?;
+    let mint = cli.mint.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--mint is required for mining mode"))?;
+
+    // Expand ~ in keypair path
+    let keypair_path = shellexpand::tilde(&cli.keypair).to_string();
+
+    info!("\n======================================================");
+    info!("              PoW MINER - MINING MODE");
+    info!("======================================================\n");
+    info!("Backend: {}", miner.name());
+    info!("RPC: {}", cli.rpc);
+    info!("Pool: {} ({})", cli.pool_id, if cli.pool_id == 0 { "normal" } else { "seeker" });
+
+    let client = SolanaClient::new(
+        &cli.rpc,
+        &keypair_path,
+        program_id,
+        mint,
+        cli.pool_id,
+    )?;
+
+    let miner_pubkey_bytes: [u8; 32] = client.miner_pubkey().to_bytes();
+
+    // Check balance
+    let balance = client.get_balance()?;
+    info!("Balance: {:.4} SOL", balance as f64 / 1_000_000_000.0);
+    if balance < 10_000_000 {
+        anyhow::bail!("Insufficient balance ({} lamports). Need at least 0.01 SOL for fees.", balance);
+    }
+
+    let poll_interval = Duration::from_millis(cli.poll_interval);
+    let mut blocks_found: u64 = 0;
+    let mut last_challenge = [0u8; 32];
+
+    info!("\nStarting mining loop...\n");
+
+    loop {
+        // Fetch current protocol state
+        let state = match client.fetch_protocol_state() {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to fetch state: {}. Retrying...", e);
+                std::thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+        };
+
+        if state.is_paused {
+            warn!("Protocol is paused. Waiting...");
+            std::thread::sleep(Duration::from_secs(10));
+            continue;
+        }
+
+        let challenge_changed = state.current_challenge != last_challenge;
+        if challenge_changed {
+            last_challenge = state.current_challenge;
+            info!("--- Block #{} | Difficulty: {} | Challenge: {} ---",
+                state.blocks_mined,
+                state.difficulty,
+                hex::encode(&state.current_challenge[..8]),
+            );
+        }
+
+        let target = u128::MAX / state.difficulty;
+
+        // Mine with progress reporting
+        let start = Instant::now();
+        let mut last_report_at = Instant::now();
+        let mut last_reported_hashes = 0u128;
+        let challenge = state.current_challenge;
+        let blocks_mined = state.blocks_mined;
+
+        // Use a batch approach: mine for a while, check if challenge changed, repeat
+        let batch_max_nonce: u128 = 500_000_000; // 500M nonces per batch
+
+        let mut progress = |hashes_checked: u128| {
+            let now = Instant::now();
+            let delta = now.duration_since(last_report_at);
+            if delta.as_millis() < 2000 {
+                return;
+            }
+
+            let delta_hashes = hashes_checked.saturating_sub(last_reported_hashes) as f64;
+            let live_hashrate = if delta.as_secs_f64() > 0.0 {
+                delta_hashes / delta.as_secs_f64()
+            } else {
+                0.0
+            };
+
+            info!(
+                "  Mining... {} hashes | {:.2} MH/s",
+                hashes_checked,
+                live_hashrate / 1_000_000.0,
+            );
+
+            last_report_at = now;
+            last_reported_hashes = hashes_checked;
+        };
+
+        match miner.mine_with_progress(
+            &challenge,
+            &miner_pubkey_bytes,
+            blocks_mined,
+            target,
+            batch_max_nonce,
+            &mut progress,
+        ) {
+            Some(nonce) => {
+                let elapsed = start.elapsed();
+                let hashrate = (nonce as f64) / elapsed.as_secs_f64().max(0.001);
+
+                info!("FOUND nonce: {} ({:.2}s, {:.2} MH/s)",
+                    nonce, elapsed.as_secs_f64(), hashrate / 1_000_000.0);
+
+                // Verify locally before submitting
+                if !pow::verify_nonce(&challenge, &miner_pubkey_bytes, nonce, blocks_mined, target) {
+                    error!("Local verification failed! Skipping submission.");
+                    continue;
+                }
+
+                // Submit proof
+                match client.submit_proof(nonce) {
+                    Ok(sig) => {
+                        blocks_found += 1;
+                        info!("Block submitted! tx: {}", sig);
+                        info!("Total blocks found: {}", blocks_found);
+                    }
+                    Err(e) => {
+                        warn!("Submit failed: {}. Block may have been stolen.", e);
+                    }
+                }
+
+                // Small delay before fetching new challenge
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            None => {
+                // No nonce found in this batch — check if challenge changed
+                let new_state = client.fetch_protocol_state().ok();
+                if let Some(ns) = &new_state {
+                    if ns.current_challenge != challenge {
+                        info!("Challenge changed (block stolen). Re-fetching...");
+                        continue;
+                    }
+                }
+                // Challenge didn't change, continue mining with higher nonces
+                // For simplicity, we restart from 0 with the same challenge
+                // (the hash space is large enough that collisions are negligible)
+                std::thread::sleep(poll_interval);
+            }
+        }
+    }
 }

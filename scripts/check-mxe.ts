@@ -3,8 +3,8 @@ import { PublicKey, Connection, Keypair } from "@solana/web3.js";
 import * as anchor from "@coral-xyz/anchor";
 import fs from "fs";
 
-const POW_PRIVACY_ID = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
-const config = JSON.parse(fs.readFileSync(__dirname + "/../miner-config-devnet.json", "utf-8"));
+const POW_PRIVACY_ID = new PublicKey("AMmu8GcoNUAdnRNKU5AqgNGdLJSLh9WLxxzxFkdtXwCh");
+const config = JSON.parse(fs.readFileSync(__dirname + "/../miner-config.json", "utf-8"));
 const conn = new Connection(config.rpc_url, "confirmed");
 
 async function main() {

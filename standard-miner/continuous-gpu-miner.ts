@@ -15,17 +15,35 @@ import {
   createAssociatedTokenAccountIdempotent,
 } from "@solana/spl-token";
 import { spawn } from "child_process";
+import bs58 from "bs58";
 import fs from "fs";
+import path from "path";
 import readline from "readline";
 
-// Config - utilise devnet par défaut, ou localhost si --local
+/**
+ * Load a Solana keypair from a file.
+ * Supports Solana CLI format (JSON array) and Phantom export (base58).
+ */
+function loadKeypair(filePath: string): Keypair {
+  const raw = fs.readFileSync(filePath, "utf-8").trim();
+  if (raw.startsWith("[")) {
+    return Keypair.fromSecretKey(new Uint8Array(JSON.parse(raw)));
+  }
+  return Keypair.fromSecretKey(bs58.decode(raw));
+}
+
+// Config - uses miner-config.json by default, or --devnet / --local overrides
+const baseDir = (process as any).pkg ? process.cwd() : path.resolve(__dirname, "..");
 const useLocal = process.argv.includes("--local");
+const useDevnet = process.argv.includes("--devnet");
 const configPath = useLocal
-  ? __dirname + "/../miner-config.json"
-  : __dirname + "/../miner-config-devnet.json";
+  ? path.join(baseDir, "miner-config.json")
+  : useDevnet
+  ? path.join(baseDir, "miner-config-devnet.json")
+  : path.join(baseDir, "miner-config.json");
 const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
-const networkLabel = useLocal ? "localhost" : "devnet";
+const networkLabel = configPath;
 const gpuBackend = String(config.gpu_backend ?? process.env.POW_GPU_BACKEND ?? "cuda");
 const configuredChallengePollIntervalMs = Number(config.challenge_poll_interval_ms ?? 1500);
 const challengePollIntervalMs = Number.isFinite(configuredChallengePollIntervalMs)
@@ -431,7 +449,11 @@ function startGpuMiner(
   promise: Promise<GpuMineResult>;
   kill: () => void;
 } {
-  const minerBinary = __dirname + "/../gpu-miner/target/release/miner";
+  // When running as pkg exe, look for gpu binary in same folder; otherwise dev path
+  const isPkg = !!(process as any).pkg;
+  const minerBinary = isPkg
+    ? path.join(process.cwd(), process.platform === "win32" ? "hashish-gpu-miner.exe" : "hashish-gpu-miner")
+    : __dirname + "/../gpu-miner/target/release/miner";
   if (!fs.existsSync(minerBinary)) {
     return {
       promise: Promise.resolve({
@@ -727,15 +749,13 @@ async function main() {
     // Connection
     const connection = new anchor.web3.Connection(config.rpc_url, "confirmed");
 
-    // Wallet
-    const walletKeypair = Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(config.wallet_path, "utf-8"))),
-    );
+    // Wallet (supports Solana CLI JSON array or Phantom base58 export)
+    const walletKeypair = loadKeypair(config.wallet_path);
     const wallet = new anchor.Wallet(walletKeypair);
     dashboard.wallet = wallet.publicKey.toString();
 
     // Load program
-    const idlPath = __dirname + "/../target/idl/pow_protocol.json";
+    const idlPath = path.join(__dirname, "..", "target", "idl", "pow_protocol.json");
     const idl = JSON.parse(fs.readFileSync(idlPath, "utf-8"));
 
     const provider = new anchor.AnchorProvider(connection, wallet, {
@@ -759,6 +779,8 @@ async function main() {
     const [mintAuthority] = PublicKey.findProgramAddressSync([MINT_AUTHORITY_SEED], POW_PROTOCOL_ID);
 
     const [feeVault] = PublicKey.findProgramAddressSync([FEE_VAULT_SEED], POW_PROTOCOL_ID);
+
+    const [cycleGate] = PublicKey.findProgramAddressSync([Buffer.from("cycle_gate")], POW_PROTOCOL_ID);
 
     const [minerStats] = PublicKey.findProgramAddressSync(
       [MINER_STATS_SEED, Buffer.from([POOL_NORMAL]), wallet.publicKey.toBuffer()],
@@ -943,6 +965,7 @@ async function main() {
               minerStats,
               feeCollector: feeVault,
               attestation: null,
+              cycleGate,
               tokenProgram: TOKEN_2022_PROGRAM_ID,
               systemProgram: SystemProgram.programId,
             } as any)

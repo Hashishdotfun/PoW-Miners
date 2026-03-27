@@ -1,0 +1,160 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-cpu-miner:
+    name: Build CPU Miner (Windows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install pkg
+        run: npm install -g @yao-pkg/pkg
+
+      - name: Compile TypeScript
+        run: npx tsc standard-miner/continuous-miner.ts --outDir dist --esModuleInterop --resolveJsonModule --module commonjs --target es2020 --skipLibCheck
+
+      - name: Inline IDL
+        run: |
+          node -e "
+          const fs = require('fs');
+          const idl = fs.readFileSync('target/idl/pow_protocol.json', 'utf-8').trim();
+          let js = fs.readFileSync('dist/continuous-miner.js', 'utf-8');
+          js = js.replace(
+            /const idlPath = .*pow_protocol\.json.*;\n\s*const idl = .*readFileSync\(idlPath.*;\n/,
+            'const idl = ' + idl + ';\n'
+          );
+          fs.writeFileSync('dist/continuous-miner.js', js);
+          if (js.includes('idlPath')) { console.error('IDL not inlined'); process.exit(1); }
+          console.log('IDL inlined');
+          "
+
+      - name: Package Windows exe
+        run: pkg dist/continuous-miner.js --targets node18-win-x64 --output hashish-cpu-miner.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpu-miner
+          path: hashish-cpu-miner.exe
+
+  build-gpu-binary:
+    name: Build GPU Binary (Windows + CUDA)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Jimver/cuda-toolkit@v0.2.18
+        with:
+          cuda: '12.5.0'
+          method: 'network'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile CUDA kernel
+        run: |
+          nvcc gpu-miner/kernels/sha256_mining.cu --ptx -o gpu-miner/kernels/sha256_mining.ptx -O3 --use_fast_math
+
+      - name: Build GPU miner
+        run: cargo build --release -p pow-miner --features cuda
+        working-directory: .
+
+      - name: Rename binary
+        run: copy target\release\miner.exe hashish-gpu-miner.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-miner
+          path: hashish-gpu-miner.exe
+
+  build-gpu-orchestrator:
+    name: Build GPU Orchestrator (Windows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install pkg
+        run: npm install -g @yao-pkg/pkg
+
+      - name: Compile TypeScript
+        run: npx tsc standard-miner/continuous-gpu-miner.ts --outDir dist --esModuleInterop --resolveJsonModule --module commonjs --target es2020 --skipLibCheck
+
+      - name: Inline IDL
+        run: |
+          node -e "
+          const fs = require('fs');
+          const idl = fs.readFileSync('target/idl/pow_protocol.json', 'utf-8').trim();
+          let js = fs.readFileSync('dist/continuous-gpu-miner.js', 'utf-8');
+          js = js.replace(
+            /const idlPath = .*pow_protocol\.json.*;\n\s*const idl = .*readFileSync\(idlPath.*;\n/,
+            'const idl = ' + idl + ';\n'
+          );
+          fs.writeFileSync('dist/continuous-gpu-miner.js', js);
+          console.log('IDL inlined');
+          "
+
+      - name: Package Windows exe
+        run: pkg dist/continuous-gpu-miner.js --targets node18-win-x64 --output hashish-gpu-orchestrator.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-orchestrator
+          path: hashish-gpu-orchestrator.exe
+
+  create-release:
+    name: Create Release
+    needs: [build-cpu-miner, build-gpu-binary, build-gpu-orchestrator]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/cpu-miner/hashish-cpu-miner.exe
+            artifacts/gpu-miner/hashish-gpu-miner.exe
+            artifacts/gpu-orchestrator/hashish-gpu-orchestrator.exe
+            miner-config.example.json
+          body: |
+            ## Hashish Miner
+
+            ### CPU Miner (simple)
+            1. Download `hashish-cpu-miner.exe` + `miner-config.example.json`
+            2. Rename config to `miner-config.json`, set your `wallet_path`
+            3. Run `hashish-cpu-miner.exe`
+
+            ### GPU Miner (NVIDIA CUDA)
+            1. Download `hashish-gpu-miner.exe` + `hashish-gpu-orchestrator.exe` + `miner-config.example.json`
+            2. Put all 3 files in the same folder
+            3. Rename config to `miner-config.json`, set your `wallet_path`
+            4. Run `hashish-gpu-orchestrator.exe`
+
+            > GPU miner requires NVIDIA GPU with CUDA drivers installed.
+
+            ### Wallet format
+            - **Solana CLI**: JSON array `[12,34,56,...]`
+            - **Phantom export**: base58 private key string

@@ -39,11 +39,11 @@ import fs from "fs";
 const useLocal = process.argv.includes("--local");
 const configPath = useLocal
   ? __dirname + "/../miner-config.json"
-  : __dirname + "/../miner-config-devnet.json";
+  : __dirname + "/../miner-config.json";
 const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
 // Program IDs
-const POW_PRIVACY_ID = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
+const POW_PRIVACY_ID = new PublicKey("AMmu8GcoNUAdnRNKU5AqgNGdLJSLh9WLxxzxFkdtXwCh");
 
 // Arcium cluster offset
 const DEFAULT_CLUSTER_OFFSET = 456;

@@ -2,7 +2,7 @@
 import { getMXEAccAddress, getCompDefAccOffset, getCompDefAccAddress } from "@arcium-hq/client";
 import { PublicKey, Connection } from "@solana/web3.js";
 
-const NEW_PROGRAM = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
+const NEW_PROGRAM = new PublicKey("AMmu8GcoNUAdnRNKU5AqgNGdLJSLh9WLxxzxFkdtXwCh");
 const conn = new Connection(
   "https://devnet.helius-rpc.com/?api-key=f4718f33-4936-4c0b-b947-e079b805c3c8",
   "confirmed"

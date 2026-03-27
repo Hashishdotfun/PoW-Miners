@@ -24,15 +24,14 @@ pow-miner/
 │   ├── init-comp-defs.ts   # Initialize Arcium computation definitions
 │   └── initialize-privacy.ts    # Initialize privacy protocol vaults
 ├── target/idl/             # Anchor IDL files (gitignored, fetched on-chain)
-├── alt-config.json         # ALT address for versioned transactions
-└── miner-config-devnet.json     # Config file (gitignored)
+└── miner-config.json       # Config file (gitignored)
 ```
 
 ## Prerequisites
 
 - **Node.js** 18+
 - **Solana CLI** (for keypair management)
-- **Anchor IDL files** in `target/idl/` (fetch from on-chain or copy from PoWSolana)
+- **Anchor IDL files** in `target/idl/` (fetch from on-chain or copy from PoW-Programs)
 - **GPU mining:** Rust 1.75+ and CUDA Toolkit 12+ (NVIDIA) or OpenCL SDK (AMD)
 - **Privacy mining:** Arcium MPC client (`@arcium-hq/client`)
 
@@ -50,15 +49,14 @@ npm install
 
 ```bash
 mkdir -p target/idl
-anchor idl fetch Ai9XrxSUmDLNCXkoeoqnYuzPgN9F2PeF9WtLq9GyqER --provider.cluster devnet -o target/idl/pow_protocol.json
-anchor idl fetch DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f --provider.cluster devnet -o target/idl/pow_privacy.json
+anchor idl fetch PoWQ79wY7LXrKaU8vZBoFb4JgSytENSdpAQAPJaZiSh --provider.cluster mainnet -o target/idl/pow_protocol.json
 ```
 
-Or copy from the PoWSolana project:
+Or copy from the PoW-Programs project:
 
 ```bash
-cp ../PoWSolana/target/idl/pow_protocol.json target/idl/
-cp ../PoWSolana/target/idl/pow_privacy.json target/idl/
+cp ../PoW-Programs/target/idl/pow_protocol.json target/idl/
+cp ../PoW-Programs/target/idl/pow_privacy.json target/idl/
 ```
 
 ### 3. Create wallets
@@ -71,30 +69,24 @@ solana-keygen new -o keys/miner.json
 solana-keygen new -o keys/relayer.json
 ```
 
-Fund with SOL:
-
-```bash
-# Devnet
-solana airdrop 2 --keypair keys/miner.json --url devnet
-solana airdrop 2 --keypair keys/relayer.json --url devnet
-```
+Fund your miner wallet with a small amount of SOL for transaction fees.
 
 ### 4. Create config file
 
 ```bash
-cp miner-config-devnet.example.json miner-config-devnet.json
+cp miner-config.example.json miner-config.json
 ```
 
-Edit `miner-config-devnet.json`:
+Edit `miner-config.json`:
 
 ```json
 {
-  "rpc_url": "https://api.devnet.solana.com",
-  "program_id": "Ai9XrxSUmDLNCXkoeoqnYuzPgN9F2PeF9WtLq9GyqER",
-  "mint": "ACnhuoJn41PQQKfhuHYgAQXR3jPSg1i4zr59Qt68QAUR",
+  "rpc_url": "https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY",
+  "program_id": "PoWQ79wY7LXrKaU8vZBoFb4JgSytENSdpAQAPJaZiSh",
+  "mint": "HASHcf66ffcWdGvswuuu8ssLWSeXpto6QaeG32AktiSh",
   "wallet_path": "/absolute/path/to/keys/miner.json",
   "relayer_wallet_path": "/absolute/path/to/keys/relayer.json",
-  "pool_id": "B9g6VbfTeJb2LERzWpFGYQMd1Pi93pzmA1v5XdDiUm98"
+  "pool_id": "0"
 }
 ```
 
@@ -114,8 +106,7 @@ Edit `miner-config-devnet.json`:
 Pure TypeScript miner using Node.js `crypto.createHash('sha256')`. Expect ~3-5 MH/s.
 
 ```bash
-npx ts-node standard-miner/continuous-miner.ts          # devnet
-npx ts-node standard-miner/continuous-miner.ts --local   # localnet
+npx ts-node standard-miner/continuous-miner.ts
 ```
 
 - Single-threaded, mines up to 100M nonces per block
@@ -146,8 +137,7 @@ cargo build --release                     # CPU fallback
 ### Run
 
 ```bash
-npx ts-node standard-miner/continuous-gpu-miner.ts          # devnet
-npx ts-node standard-miner/continuous-gpu-miner.ts --local   # localnet
+npx ts-node standard-miner/continuous-gpu-miner.ts
 ```
 
 The orchestrator fetches the current challenge + difficulty from on-chain, spawns the Rust binary with `--backend cuda`, parses the nonce from stdout, and submits the proof.
@@ -159,7 +149,7 @@ The terminal dashboard now shows:
 - hashes checked during the current round
 - current block/challenge state and last submit tx
 
-Optional GPU tuning fields in `miner-config-devnet.json`:
+Optional GPU tuning fields in `miner-config.json`:
 
 ```json
 {
@@ -218,8 +208,7 @@ npx ts-node scripts/init-comp-defs.ts
 ### Run
 
 ```bash
-npx ts-node privacy-miner/continuous-privacy-miner-arcium.ts          # devnet
-npx ts-node privacy-miner/continuous-privacy-miner-arcium.ts --local   # localnet
+npx ts-node privacy-miner/continuous-privacy-miner-arcium.ts
 ```
 
 ### Interactive menu (press M during mining)
@@ -275,14 +264,13 @@ All pending claims (secret, destination, computation offset) are stored in a loc
                                        Off-chain computation
 ```
 
-## Program IDs (Devnet)
+## Program IDs (Mainnet)
 
 | Program | Address |
 |---------|---------|
-| **pow-protocol** | `Ai9XrxSUmDLNCXkoeoqnYuzPgN9F2PeF9WtLq9GyqER` |
-| **pow-privacy** | `DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f` |
-| **Arcium** | `Arcj82pX7HxYKLR92qvgZUAd7vGS1k4hQvAFcPATFdEQ` |
-| **Token Mint** | `ACnhuoJn41PQQKfhuHYgAQXR3jPSg1i4zr59Qt68QAUR` |
+| **pow-protocol** | `PoWQ79wY7LXrKaU8vZBoFb4JgSytENSdpAQAPJaZiSh` |
+| **pow-treasury** | `LPAtdQ9sYQGXNs3RejVcWgi2u516nedpHABdwzmQish` |
+| **Token Mint (HASH)** | `HASHcf66ffcWdGvswuuu8ssLWSeXpto6QaeG32AktiSh` |
 
 ## Troubleshooting
 
@@ -291,7 +279,7 @@ All pending claims (secret, destination, computation offset) are stored in a loc
 | `Failed to get MXE public key` | Arcium DKG not complete | Re-deploy with `arcium deploy --cluster-offset 456` |
 | `Transaction too large` | Too many accounts (>1232 bytes) | Run `npx ts-node scripts/create-alt.ts` to create ALT |
 | `AccountNotInitialized` (shared vaults) | Protocol not initialized | Run `npx ts-node scripts/initialize-privacy.ts` |
-| `InvalidProgramId` (token_program) | IDL mismatch | Re-fetch IDL: `anchor idl fetch <program> --provider.cluster devnet` |
+| `InvalidProgramId` (token_program) | IDL mismatch | Re-fetch IDL: `anchor idl fetch <program> --provider.cluster mainnet` |
 
 ## License
 

@@ -20,31 +20,52 @@ import fs from "fs";
 import BN from "bn.js";
 
 // Load config (use devnet config)
-const config = JSON.parse(fs.readFileSync(__dirname + "/../miner-config-devnet.json", "utf-8"));
+const config = JSON.parse(fs.readFileSync(__dirname + "/../miner-config.json", "utf-8"));
 
 // Program IDs
-const POW_PRIVACY_ID = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
+const POW_PRIVACY_ID = new PublicKey("AMmu8GcoNUAdnRNKU5AqgNGdLJSLh9WLxxzxFkdtXwCh");
 const ARCIUM_PROGRAM_ID = getArciumProgramId();
 const LUT_PROGRAM_ID = AddressLookupTableProgram.programId;
 
 // Sign PDA seed
 const SIGN_PDA_SEED = Buffer.from("ArciumSignerAccount");
 
-// Derive MXE LUT address from offset slot
-function deriveMxeLutAddress(mxeAccount: PublicKey, lutOffsetSlot: BN): PublicKey {
-  const [lutAddress] = PublicKey.findProgramAddressSync(
-    [
-      mxeAccount.toBuffer(),
-      lutOffsetSlot.toArrayLike(Buffer, "le", 8),
-    ],
-    LUT_PROGRAM_ID
-  );
-  return lutAddress;
+// Find the MXE's LUT by reading its last_extended_slot and scanning backwards
+async function findMxeLutAddress(connection: anchor.web3.Connection, mxeAccount: PublicKey): Promise<PublicKey> {
+  const { getLookupTableAddress } = require("@arcium-hq/client");
+
+  // First, try the known LUT address (hardcoded for this MXE deployment)
+  const knownLut = new PublicKey("9idMyViC3aNqa6DHxWJwdbppSk8c49GYJMvpowkBp7vj");
+  const knownInfo = await connection.getAccountInfo(knownLut);
+  if (knownInfo && knownInfo.owner.equals(LUT_PROGRAM_ID)) {
+    // Verify authority matches our MXE
+    const authority = new PublicKey(knownInfo.data.subarray(22, 54));
+    if (authority.equals(mxeAccount)) {
+      return knownLut;
+    }
+  }
+
+  // Fallback: scan around the last_extended_slot of any known LUT
+  // Try getLookupTableAddress with slots near recent slot
+  const slot = await connection.getSlot();
+  for (let delta = 0; delta < 5000; delta++) {
+    const testSlot = new BN(slot - delta);
+    try {
+      const derived = getLookupTableAddress(POW_PRIVACY_ID, testSlot);
+      const acctInfo = await connection.getAccountInfo(derived);
+      if (acctInfo && acctInfo.owner.equals(LUT_PROGRAM_ID)) {
+        console.log(`Found LUT at slot ${testSlot.toString()}`);
+        return derived;
+      }
+    } catch {}
+  }
+
+  throw new Error("Could not find MXE LUT address");
 }
 
 async function main() {
-  // Setup provider
-  const walletPath = config.wallet_path;
+  // Setup provider — use deployer wallet (MXE authority), not miner wallet
+  const walletPath = process.env.DEPLOYER_WALLET || "/home/antoninweb3/PoWSolana/keys/devnet-deployer.json";
   const walletKeypair = anchor.web3.Keypair.fromSecretKey(
     new Uint8Array(JSON.parse(fs.readFileSync(walletPath, "utf-8")))
   );
@@ -60,53 +81,40 @@ async function main() {
   console.log("Program:", POW_PRIVACY_ID.toString());
 
   // Load the IDL
-  const idl = JSON.parse(
-    fs.readFileSync(__dirname + "/../target/idl/pow_privacy.json", "utf-8")
-  );
+  const idlPath = __dirname + "/../../PoW-Programs/target/idl/pow_privacy.json";
+  let idl: any;
+  try {
+    idl = JSON.parse(fs.readFileSync(idlPath, "utf-8"));
+  } catch {
+    const fallbackPath = __dirname + "/../target/idl/pow_privacy.json";
+    idl = JSON.parse(fs.readFileSync(fallbackPath, "utf-8"));
+  }
   const powPrivacy = new anchor.Program(idl, provider);
 
   // The MXE account for pow-privacy on devnet
-  // Note: This is the MXE registered for the pow-privacy program
-  // Use the working MXE address from the miner output
   const mxeAccount = getMXEAccAddress(POW_PRIVACY_ID);
   console.log("Derived MXE Account:", mxeAccount.toString());
 
-  // Check if it exists, if not use a known working MXE
+  // Check if it exists
   let mxeAccountInfo = await connection.getAccountInfo(mxeAccount);
   let actualMxeAccount = mxeAccount;
 
   if (!mxeAccountInfo) {
-    // The derived MXE doesn't exist, try the known working MXE from devnet
-    // This is the MXE that was shown in the miner output
+    // Try known working MXE from devnet
     const knownMxeAccount = new PublicKey("DiwsvsWEdkwp5hCWJ5JE2dU7bNfs6X3VhqR1MDTea8uy");
     mxeAccountInfo = await connection.getAccountInfo(knownMxeAccount);
     if (mxeAccountInfo) {
       actualMxeAccount = knownMxeAccount;
       console.log("Using known MXE Account:", actualMxeAccount.toString());
     } else {
-      throw new Error("MXE account not found. Initialize the MXE first.");
+      throw new Error("MXE account not found. Initialize the MXE first with 'arcium init-mxe'.");
     }
   }
 
-  // lut_offset_slot is in the MXE account data at offset 256 (based on inspection)
-  // It's stored as the first u32/u64 in the latter part of the account
-  const data = mxeAccountInfo.data;
-  console.log("MXE account data length:", data.length);
+  console.log("MXE account data length:", mxeAccountInfo.data.length);
 
-  // The MXE account has lut_offset_slot at offset 256 as a u64
-  // Based on hex dump: f3 38 1a 00 00 00 00 07
-  // Read as u64 LE this gives a large number, but looking at the pattern
-  // it seems like the slot is actually at a 4-byte boundary
-  // Let's try reading it as the value at offset 256
-
-  // Try offset 256 as the start of lut_offset_slot
-  // Looking at the data, bytes 256-263 contain what appears to be the slot
-  const lutOffsetSlot = new BN(Uint8Array.prototype.slice.call(data, 256, 264), 'le');
-  console.log("LUT Offset Slot (offset 256):", lutOffsetSlot.toString());
-  console.log("LUT Offset Slot hex:", lutOffsetSlot.toString(16));
-
-  // Derive the LUT address
-  const lutAddress = deriveMxeLutAddress(actualMxeAccount, lutOffsetSlot);
+  // Find the LUT address for this MXE
+  const lutAddress = await findMxeLutAddress(connection, actualMxeAccount);
   console.log("LUT Address:", lutAddress.toString());
 
   // Sign PDA
@@ -116,50 +124,33 @@ async function main() {
   );
   console.log("Sign PDA:", signPdaAccount.toString());
 
-  // Computation definitions to initialize
-  const compDefs = [
-    "verify_and_claim",
-    "deposit_fee",
-    "mine_block",
-    "withdraw_fee",
-    "check_miner_balance",
+  // Computation definitions to initialize (updated: no more verify_and_claim, added deposit_token + withdraw_token)
+  const compDefs: { name: string; methodName: string }[] = [
+    { name: "deposit_fee", methodName: "initDepositFeeCompDef" },
+    { name: "mine_block", methodName: "initMineBlockCompDef" },
+    { name: "withdraw_fee", methodName: "initWithdrawFeeCompDef" },
+    { name: "check_miner_balance", methodName: "initCheckBalanceCompDef" },
+    { name: "deposit_token", methodName: "initDepositTokenCompDef" },
+    { name: "withdraw_token", methodName: "initWithdrawTokenCompDef" },
   ];
 
-  for (const compDefName of compDefs) {
-    const offset = Buffer.from(getCompDefAccOffset(compDefName)).readUInt32LE();
+  for (const compDef of compDefs) {
+    const offset = Buffer.from(getCompDefAccOffset(compDef.name)).readUInt32LE();
     const compDefAddress = getCompDefAccAddress(POW_PRIVACY_ID, offset);
 
     // Check if already initialized
     const accountInfo = await connection.getAccountInfo(compDefAddress);
     if (accountInfo) {
-      console.log(`✓ ${compDefName} already initialized: ${compDefAddress.toString()}`);
+      console.log(`\n[OK] ${compDef.name} already initialized: ${compDefAddress.toString()}`);
       continue;
     }
 
-    console.log(`\nInitializing ${compDefName}...`);
+    console.log(`\nInitializing ${compDef.name}...`);
     console.log(`  Offset: ${offset}`);
     console.log(`  Address: ${compDefAddress.toString()}`);
 
     try {
-      // Map comp def name to instruction name
-      const instructionName = `init${compDefName.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('')}CompDef`;
-
-      // Build the instruction based on the name
-      let method: any;
-      if (compDefName === "verify_and_claim") {
-        method = powPrivacy.methods.initVerifyAndClaimCompDef();
-      } else if (compDefName === "deposit_fee") {
-        method = powPrivacy.methods.initDepositFeeCompDef();
-      } else if (compDefName === "mine_block") {
-        method = powPrivacy.methods.initMineBlockCompDef();
-      } else if (compDefName === "withdraw_fee") {
-        method = powPrivacy.methods.initWithdrawFeeCompDef();
-      } else if (compDefName === "check_miner_balance") {
-        method = powPrivacy.methods.initCheckBalanceCompDef();
-      } else {
-        console.log(`  Unknown comp def: ${compDefName}, skipping`);
-        continue;
-      }
+      const method = (powPrivacy.methods as any)[compDef.methodName]();
 
       const tx = await method
         .accounts({
@@ -173,12 +164,12 @@ async function main() {
         })
         .rpc();
 
-      console.log(`  ✓ Initialized: ${tx}`);
+      console.log(`  [OK] Initialized: ${tx}`);
     } catch (err: any) {
       if (err?.message?.includes("already in use")) {
-        console.log(`  ✓ Already initialized`);
+        console.log(`  [OK] Already initialized`);
       } else {
-        console.error(`  ✗ Failed: ${err?.message || err}`);
+        console.error(`  [FAIL] ${err?.message || err}`);
         if (err?.logs) {
           console.error("  Logs:", err.logs.slice(-5).join("\n  "));
         }

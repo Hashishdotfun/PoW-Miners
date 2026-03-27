@@ -3,8 +3,8 @@ import { getMXEAccAddress, getMXEPublicKey } from "@arcium-hq/client";
 import { PublicKey, Connection } from "@solana/web3.js";
 import * as anchor from "@coral-xyz/anchor";
 
-const NEW_PROGRAM = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
-const OLD_PROGRAM = new PublicKey("9iC7Ez6VcqG9TvPEZ31szdnhUrsCYBvmj2u9YeDBWErT");
+const NEW_PROGRAM = new PublicKey("AMmu8GcoNUAdnRNKU5AqgNGdLJSLh9WLxxzxFkdtXwCh");
+const OLD_PROGRAM = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
 
 const mxeNew = getMXEAccAddress(NEW_PROGRAM);
 const mxeOld = getMXEAccAddress(OLD_PROGRAM);

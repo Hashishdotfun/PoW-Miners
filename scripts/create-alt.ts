@@ -28,11 +28,11 @@ import {
 import fs from "fs";
 
 // Load config (use devnet config)
-const config = JSON.parse(fs.readFileSync(__dirname + "/../miner-config-devnet.json", "utf-8"));
+const config = JSON.parse(fs.readFileSync(__dirname + "/../miner-config.json", "utf-8"));
 
 // Program IDs (from pow-programs Anchor.toml devnet)
-const POW_PROTOCOL_ID = new PublicKey("Ai9XrxSUmDLNCXkoeoqnYuzPgN9F2PeF9WtLq9GyqER");
-const POW_PRIVACY_ID = new PublicKey("DJB2PeDYBLczs5ZxmUrqpoEAuejgdP516J3fNsEXVY5f");
+const POW_PROTOCOL_ID = new PublicKey("8ShwcqBzuknRJdGP2HoupsMEAMjvyqqwjjWWQmJVHChG");
+const POW_PRIVACY_ID = new PublicKey("AMmu8GcoNUAdnRNKU5AqgNGdLJSLh9WLxxzxFkdtXwCh");
 const ARCIUM_PROGRAM_ID = getArciumProgramId();
 
 // Constants
@@ -49,7 +49,7 @@ const PRIVACY_MINER_STATS_SEED = Buffer.from("privacy_miner_stats");
 const ARCIUM_SIGN_PDA_SEED = Buffer.from("ArciumSignerAccount");
 
 // Mint (from config or default)
-const MINT = new PublicKey(config.mint || "EwxKGUi1P7e3c3bJTw4kNWNXCNy5TYzGrLZ11R3wLGsP");
+const MINT = new PublicKey(config.mint || "21PYNvAoQq8bHbjz4TArSc9Bxnp2k23DDPGbF9evMLr9");
 
 async function main() {
   // Setup provider

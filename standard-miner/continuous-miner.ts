@@ -15,15 +15,38 @@ import {
   createAssociatedTokenAccountIdempotent
 } from "@solana/spl-token";
 import * as crypto from "crypto";
+import bs58 from "bs58";
 import fs from "fs";
+import path from "path";
 
-// Config - uses devnet by default, or localhost if --local
+/**
+ * Load a Solana keypair from a file.
+ * Supports:
+ *  - Solana CLI format: JSON array of 64 bytes [12,34,56,...]
+ *  - Phantom export format: base58-encoded private key string
+ */
+function loadKeypair(filePath: string): Keypair {
+  const raw = fs.readFileSync(filePath, "utf-8").trim();
+  // Try JSON array first (Solana CLI format)
+  if (raw.startsWith("[")) {
+    return Keypair.fromSecretKey(new Uint8Array(JSON.parse(raw)));
+  }
+  // Otherwise treat as base58 (Phantom export)
+  return Keypair.fromSecretKey(bs58.decode(raw));
+}
+
+// Config - uses miner-config.json by default, or --devnet / --local overrides
+// When running as a pkg executable, use process.cwd() instead of __dirname
+const baseDir = (process as any).pkg ? process.cwd() : path.resolve(__dirname, "..");
 const useLocal = process.argv.includes("--local");
+const useDevnet = process.argv.includes("--devnet");
 const configPath = useLocal
-  ? __dirname + "/../miner-config.json"
-  : __dirname + "/../miner-config-devnet.json";
+  ? path.join(baseDir, "miner-config.json")
+  : useDevnet
+  ? path.join(baseDir, "miner-config-devnet.json")
+  : path.join(baseDir, "miner-config.json");
 const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-console.log(`Using config: ${useLocal ? "localhost" : "devnet"}`);
+console.log(`Using config: ${configPath}`);
 
 const POW_PROTOCOL_ID = new PublicKey(config.program_id);
 const MINT = new PublicKey(config.mint);
@@ -120,10 +143,8 @@ async function main() {
   // Connection
   const connection = new anchor.web3.Connection(config.rpc_url, "confirmed");
 
-  // Wallet
-  const walletKeypair = Keypair.fromSecretKey(
-    new Uint8Array(JSON.parse(fs.readFileSync(config.wallet_path, "utf-8")))
-  );
+  // Wallet (supports Solana CLI JSON array or Phantom base58 export)
+  const walletKeypair = loadKeypair(config.wallet_path);
   const wallet = new anchor.Wallet(walletKeypair);
 
   console.log("📍 Miner:", wallet.publicKey.toString());
@@ -131,7 +152,7 @@ async function main() {
   console.log("");
 
   // Load program
-  const idlPath = __dirname + "/../target/idl/pow_protocol.json";
+  const idlPath = path.join(__dirname, "..", "target", "idl", "pow_protocol.json");
   const idl = JSON.parse(fs.readFileSync(idlPath, "utf-8"));
 
   const provider = new anchor.AnchorProvider(connection, wallet, {
